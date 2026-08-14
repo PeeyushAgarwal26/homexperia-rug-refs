@@ -1,0 +1,4 @@
+source .venv/bin/activate
+ps aux | grep flask
+kill -9 <PID>
+nohup flask run --host=0.0.0.0 --port=3000 > flask.log 2>&1 &

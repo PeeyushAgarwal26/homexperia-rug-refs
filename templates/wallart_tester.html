@@ -1,0 +1,636 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Wall-Art Visualizer Tester</title>
+    <style>
+        :root {
+            --bg: #12141a;
+            --panel: #1c1f28;
+            --line: #2c3040;
+            --txt: #e6e8ee;
+            --muted: #8b90a0;
+            --accent: #4c8bf5;
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+            font-family: system-ui, sans-serif;
+            background: var(--bg);
+            color: var(--txt);
+        }
+
+        .wrap {
+            display: flex;
+            gap: 16px;
+            padding: 16px;
+            align-items: flex-start;
+            flex-wrap: wrap;
+        }
+
+        .panel {
+            background: var(--panel);
+            border: 1px solid var(--line);
+            border-radius: 10px;
+            padding: 16px;
+        }
+
+        .controls {
+            width: 320px;
+            flex: 0 0 320px;
+        }
+
+        h1 {
+            font-size: 16px;
+            margin: 0 0 12px;
+        }
+
+        h2 {
+            font-size: 12px;
+            text-transform: uppercase;
+            letter-spacing: .05em;
+            color: var(--muted);
+            margin: 16px 0 6px;
+        }
+
+        label {
+            display: block;
+            font-size: 13px;
+            margin: 8px 0 3px;
+            color: var(--muted);
+        }
+
+        input[type=text],
+        input[type=number],
+        input[type=file] {
+            width: 100%;
+            padding: 7px 9px;
+            background: #0f1117;
+            border: 1px solid var(--line);
+            border-radius: 6px;
+            color: var(--txt);
+            font-size: 13px;
+        }
+
+        .row {
+            display: flex;
+            gap: 8px;
+        }
+
+        .row>div {
+            flex: 1;
+        }
+
+        button {
+            width: 100%;
+            margin-top: 14px;
+            padding: 10px;
+            background: var(--accent);
+            color: #fff;
+            border: none;
+            border-radius: 7px;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+        }
+
+        button:disabled {
+            opacity: .5;
+            cursor: not-allowed;
+        }
+
+        .stage {
+            position: relative;
+            line-height: 0;
+        }
+
+        #gl,
+        #overlay {
+            border-radius: 10px;
+            display: block;
+        }
+
+        #overlay {
+            position: absolute;
+            left: 0;
+            top: 0;
+            cursor: grab;
+        }
+
+        #overlay.dragging {
+            cursor: grabbing;
+        }
+
+        .checks {
+            font-size: 13px;
+        }
+
+        .checks label {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            color: var(--txt);
+            cursor: pointer;
+            margin: 6px 0;
+        }
+
+        .checks input {
+            width: auto;
+        }
+
+        .status {
+            font-size: 13px;
+            margin-top: 10px;
+            padding: 8px 10px;
+            border-radius: 6px;
+            min-height: 18px;
+        }
+
+        .status.err {
+            background: #3a1d22;
+            color: #ffb3b3;
+        }
+
+        .status.ok {
+            background: #1d3a24;
+            color: #b3ffc4;
+        }
+
+        .info {
+            font-size: 12px;
+            color: var(--muted);
+            line-height: 1.7;
+        }
+
+        .info b {
+            color: var(--txt);
+        }
+
+        pre {
+            background: #0f1117;
+            border: 1px solid var(--line);
+            border-radius: 6px;
+            padding: 10px;
+            font-size: 11px;
+            max-height: 260px;
+            overflow: auto;
+            white-space: pre-wrap;
+            word-break: break-all;
+        }
+
+        .hint {
+            font-size: 11px;
+            color: var(--muted);
+            margin-top: 2px;
+        }
+
+        .swatch {
+            display: inline-block;
+            width: 11px;
+            height: 11px;
+            border-radius: 2px;
+            margin-right: 5px;
+            vertical-align: middle;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="wrap">
+        <!-- ── Controls ─────────────────────────────────────────────── -->
+        <div class="panel controls">
+            <h1>Wall-Art Visualizer Tester</h1>
+
+            <h2>Auth</h2>
+            <label>x-api-key</label>
+            <input type="text" id="apiKey" placeholder="paste API key (remembered)">
+
+            <h2>Inputs</h2>
+            <label>Room image (upload)</label>
+            <input type="file" id="roomFile" accept="image/*">
+            <label>Product image (upload)</label>
+            <input type="file" id="productFile" accept="image/*">
+            <label>Wall mask URL</label>
+            <input type="text" id="maskUrl" placeholder="https://api.homexperia.com/masks/....png">
+            <div class="hint">Mask sent as a URL (the backend downloads it).</div>
+
+            <h2>Product dimensions (cm, optional)</h2>
+            <div class="row">
+                <div><label>width</label><input type="number" id="pdWidth" min="1" step="1" placeholder="e.g. 60">
+                </div>
+                <div><label>length</label><input type="number" id="pdLength" min="1" step="1" placeholder="e.g. 90">
+                </div>
+            </div>
+            <div class="hint">Leave both blank to test the 75 cm default.</div>
+
+            <button id="submitBtn">Submit &amp; Visualize</button>
+            <div class="status" id="status"></div>
+
+            <h2>View</h2>
+            <div class="checks">
+                <label><input type="checkbox" id="cbOcclude" checked> Occlusion (art behind obstacles)</label>
+                <label><input type="checkbox" id="cbOverlay" checked> Debug overlays</label>
+            </div>
+            <div class="info" id="overlayLegend" style="display:none">
+                <span class="swatch" style="background:#4c8bf5"></span>wall quad&nbsp;
+                <span class="swatch" style="background:#38d16a"></span>art&nbsp;
+                <span class="swatch" style="background:#f5c542"></span>clear region
+            </div>
+            <div class="hint">Drag the art to move it along the wall. Scroll over it to resize (aspect locked).
+            </div>
+        </div>
+
+        <!-- ── Stage ────────────────────────────────────────────────── -->
+        <div class="panel">
+            <div class="stage">
+                <canvas id="gl"></canvas>
+                <canvas id="overlay"></canvas>
+            </div>
+            <div class="info" id="readout" style="margin-top:12px"></div>
+        </div>
+
+        <!-- ── Raw response ─────────────────────────────────────────── -->
+        <div class="panel" style="width:340px; flex:0 0 340px;">
+            <h2>Raw response</h2>
+            <pre id="raw">—</pre>
+        </div>
+    </div>
+
+    <script>
+        "use strict";
+        const $ = id => document.getElementById(id);
+        const ENDPOINT = "/api/wallart-visualizer-scene";
+
+        // ── API key persistence ─────────────────────────────────────────
+        $("apiKey").value = localStorage.getItem("hx_api_key") || "";
+        $("apiKey").addEventListener("change", e => localStorage.setItem("hx_api_key", e.target.value.trim()));
+
+        function setStatus(msg, kind) {
+            const el = $("status");
+            el.textContent = msg || "";
+            el.className = "status" + (kind ? " " + kind : "");
+        }
+
+        // ── File → {dataURL, b64} ───────────────────────────────────────
+        function readFile(input) {
+            return new Promise((resolve, reject) => {
+                const f = input.files && input.files[0];
+                if (!f) return resolve(null);
+                const r = new FileReader();
+                r.onload = () => resolve({ dataURL: r.result, b64: String(r.result).split(",")[1] });
+                r.onerror = reject;
+                r.readAsDataURL(f);
+            });
+        }
+        function loadImage(src) {
+            return new Promise((resolve, reject) => {
+                const img = new Image();
+                img.crossOrigin = "anonymous";
+                img.onload = () => resolve(img);
+                img.onerror = () => reject(new Error("image load failed: " + String(src).slice(0, 64)));
+                img.src = src;
+            });
+        }
+
+        // ── 3x3 homography helpers (row-major length-9, h8 = 1) ─────────
+        function solveLinear(A, b) {           // Gaussian elimination, n up to 8
+            const n = b.length;
+            for (let i = 0; i < n; i++) {
+                let piv = i;
+                for (let r = i + 1; r < n; r++) if (Math.abs(A[r][i]) > Math.abs(A[piv][i])) piv = r;
+                if (Math.abs(A[piv][i]) < 1e-12) return null;
+                [A[i], A[piv]] = [A[piv], A[i]];[b[i], b[piv]] = [b[piv], b[i]];
+                for (let r = 0; r < n; r++) {
+                    if (r === i) continue;
+                    const f = A[r][i] / A[i][i];
+                    for (let c = i; c < n; c++) A[r][c] -= f * A[i][c];
+                    b[r] -= f * b[i];
+                }
+            }
+            return b.map((v, i) => v / A[i][i]);
+        }
+        function homography(src, dst) {        // src[4],dst[4] of [x,y] -> H (len 9)
+            const A = [], b = [];
+            for (let i = 0; i < 4; i++) {
+                const [x, y] = src[i], [X, Y] = dst[i];
+                A.push([x, y, 1, 0, 0, 0, -x * X, -y * X]); b.push(X);
+                A.push([0, 0, 0, x, y, 1, -x * Y, -y * Y]); b.push(Y);
+            }
+            const h = solveLinear(A, b);
+            return h ? [h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], 1] : null;
+        }
+        function applyH(H, p) {
+            const x = p[0], y = p[1];
+            const w = H[6] * x + H[7] * y + H[8];
+            return [(H[0] * x + H[1] * y + H[2]) / w, (H[3] * x + H[4] * y + H[5]) / w];
+        }
+        function invert3x3(m) {
+            const [a, b, c, d, e, f, g, h, i] = m;
+            const A = e * i - f * h, B = -(d * i - f * g), C = d * h - e * g;
+            const det = a * A + b * B + c * C;
+            if (Math.abs(det) < 1e-12) return null;
+            const id = 1 / det;
+            return [
+                A * id, (c * h - b * i) * id, (b * f - c * e) * id,
+                B * id, (a * i - c * g) * id, (c * d - a * f) * id,
+                C * id, (b * g - a * h) * id, (a * e - b * d) * id,
+            ];
+        }
+        // GLSL mat3 is column-major: upload transpose of the row-major H
+        function H_to_mat3(H) {
+            return new Float32Array([H[0], H[3], H[6], H[1], H[4], H[7], H[2], H[5], H[8]]);
+        }
+
+        // ── WebGL setup ─────────────────────────────────────────────────
+        const gl = $("gl").getContext("webgl", { premultipliedAlpha: false, alpha: false });
+        if (!gl) setStatus("WebGL not available in this browser.", "err");
+
+        function compile(type, src) {
+            const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+            if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+            return s;
+        }
+        function program(vs, fs) {
+            const p = gl.createProgram();
+            gl.attachShader(p, compile(gl.VERTEX_SHADER, vs));
+            gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fs));
+            gl.linkProgram(p);
+            if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+            return p;
+        }
+
+        // Room program: textured full [0,1] quad (ny=0 is image top)
+        const roomProg = program(
+            `attribute vec2 a_pos; varying vec2 v_uv;
+void main(){ v_uv = a_pos; gl_Position = vec4(a_pos.x*2.0-1.0, 1.0-a_pos.y*2.0, 0.0, 1.0); }`,
+            `precision mediump float; uniform sampler2D u_tex; varying vec2 v_uv;
+void main(){ gl_FragColor = texture2D(u_tex, vec2(v_uv.x, 1.0 - v_uv.y)); }`
+        );
+        // Product program: projective texture into an image-space quad, with occlusion
+        const prodProg = program(
+            `attribute vec2 a_img; varying vec2 v_img;
+void main(){ v_img = a_img; gl_Position = vec4(a_img.x*2.0-1.0, 1.0-a_img.y*2.0, 0.0, 1.0); }`,
+            `precision highp float;
+uniform sampler2D u_product, u_mask; uniform mat3 u_Huv; uniform bool u_occlude;
+varying vec2 v_img;
+void main(){
+    vec3 p = u_Huv * vec3(v_img, 1.0);
+    vec2 uv = p.xy / p.z;
+    if(uv.x<0.0||uv.x>1.0||uv.y<0.0||uv.y>1.0) discard;
+    if(u_occlude){
+    float m = texture2D(u_mask, vec2(v_img.x, 1.0 - v_img.y)).r;
+    if(m < 0.5) discard;
+    }
+    vec4 col = texture2D(u_product, vec2(uv.x, 1.0 - uv.y));
+    if(col.a < 0.02) discard;
+    gl_FragColor = col;
+}`
+        );
+        const quadBuf = gl.createBuffer();
+        function makeTexture(img) {
+            const t = gl.createTexture();
+            gl.bindTexture(gl.TEXTURE_2D, t);
+            gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+            return t;
+        }
+
+        // ── Scene state ─────────────────────────────────────────────────
+        const S = {
+            roomTex: null, prodTex: null, maskTex: null,
+            resp: null,
+            Hwall: null, HwallInv: null,          // plane(ft) <-> image-norm
+            clearBox: null,                        // {x0,y0,x1,y1} in plane ft
+            art: null,                             // {cx,cy,w,h} in plane ft
+            artImg: null,                          // current 4 image-norm corners
+        };
+
+        function planeRectCorners(a) {           // TL,TR,BR,BL of {cx,cy,w,h}
+            const hw = a.w / 2, hh = a.h / 2;
+            return [[a.cx - hw, a.cy - hh], [a.cx + hw, a.cy - hh], [a.cx + hw, a.cy + hh], [a.cx - hw, a.cy + hh]];
+        }
+        function clampArt() {
+            const b = S.clearBox, a = S.art;
+            if (!b) return;
+            const hw = a.w / 2, hh = a.h / 2;
+            if (b.x1 - b.x0 >= a.w) a.cx = Math.min(Math.max(a.cx, b.x0 + hw), b.x1 - hw);
+            else a.cx = (b.x0 + b.x1) / 2;
+            if (b.y1 - b.y0 >= a.h) a.cy = Math.min(Math.max(a.cy, b.y0 + hh), b.y1 - hh);
+            else a.cy = (b.y0 + b.y1) / 2;
+        }
+
+        function initFromResponse(resp) {
+            S.resp = resp;
+            const Wft = resp.wall_width_ft, Hft = resp.wall_height_ft;
+            const planeRect = [[0, 0], [Wft, 0], [Wft, Hft], [0, Hft]];
+            S.Hwall = homography(planeRect, resp.wall_quad_norm);
+            S.HwallInv = S.Hwall ? invert3x3(S.Hwall) : null;
+
+            if (S.HwallInv) {
+                const pp = resp.placement_quad_norm.map(p => applyH(S.HwallInv, p));
+                const xs = pp.map(p => p[0]), ys = pp.map(p => p[1]);
+                S.art = {
+                    cx: (Math.min(...xs) + Math.max(...xs)) / 2, cy: (Math.min(...ys) + Math.max(...ys)) / 2,
+                    w: Math.max(...xs) - Math.min(...xs), h: Math.max(...ys) - Math.min(...ys)
+                };
+                const cp = resp.clear_region_quad_norm.map(p => applyH(S.HwallInv, p));
+                const cxs = cp.map(p => p[0]), cys = cp.map(p => p[1]);
+                S.clearBox = { x0: Math.min(...cxs), y0: Math.min(...cys), x1: Math.max(...cxs), y1: Math.max(...cys) };
+            } else {
+                S.art = null; S.clearBox = null;   // degenerate wall -> render raw placement
+            }
+        }
+
+        function currentArtImgCorners() {
+            if (S.art && S.Hwall) return planeRectCorners(S.art).map(p => applyH(S.Hwall, p));
+            return S.resp.placement_quad_norm;    // fallback: raw placement
+        }
+
+        function render() {
+            if (!S.resp) return;
+            const cv = $("gl"); gl.viewport(0, 0, cv.width, cv.height);
+            gl.clearColor(0, 0, 0, 1); gl.clear(gl.COLOR_BUFFER_BIT);
+            gl.disable(gl.DEPTH_TEST);
+
+            // 1) Room background
+            gl.useProgram(roomProg);
+            const full = new Float32Array([0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1]);
+            gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
+            gl.bufferData(gl.ARRAY_BUFFER, full, gl.STREAM_DRAW);
+            const aPos = gl.getAttribLocation(roomProg, "a_pos");
+            gl.enableVertexAttribArray(aPos); gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+            gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, S.roomTex);
+            gl.uniform1i(gl.getUniformLocation(roomProg, "u_tex"), 0);
+            gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+            // 2) Product quad (projective + occlusion)
+            const c = currentArtImgCorners();
+            S.artImg = c;
+            const Huv = homography(c, [[0, 0], [1, 0], [1, 1], [0, 1]]);
+            if (Huv) {
+                gl.useProgram(prodProg);
+                const verts = new Float32Array([
+                    c[0][0], c[0][1], c[1][0], c[1][1], c[2][0], c[2][1],
+                    c[0][0], c[0][1], c[2][0], c[2][1], c[3][0], c[3][1],
+                ]);
+                gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
+                gl.bufferData(gl.ARRAY_BUFFER, verts, gl.STREAM_DRAW);
+                const aImg = gl.getAttribLocation(prodProg, "a_img");
+                gl.enableVertexAttribArray(aImg); gl.vertexAttribPointer(aImg, 2, gl.FLOAT, false, 0, 0);
+                gl.uniformMatrix3fv(gl.getUniformLocation(prodProg, "u_Huv"), false, H_to_mat3(Huv));
+                gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, S.prodTex);
+                gl.uniform1i(gl.getUniformLocation(prodProg, "u_product"), 0);
+                gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, S.maskTex);
+                gl.uniform1i(gl.getUniformLocation(prodProg, "u_mask"), 1);
+                gl.uniform1i(gl.getUniformLocation(prodProg, "u_occlude"), $("cbOcclude").checked && S.maskTex ? 1 : 0);
+                gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+                gl.drawArrays(gl.TRIANGLES, 0, 6);
+                gl.disable(gl.BLEND);
+            }
+            drawOverlay();
+        }
+
+        // ── Debug overlay (2D canvas on top) ────────────────────────────
+        function drawOverlay() {
+            const cv = $("overlay"), ctx = cv.getContext("2d");
+            ctx.clearRect(0, 0, cv.width, cv.height);
+            $("overlayLegend").style.display = $("cbOverlay").checked ? "block" : "none";
+            if (!$("cbOverlay").checked || !S.resp) return;
+            const W = cv.width, H = cv.height;
+            const poly = (pts, color) => {
+                ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.beginPath();
+                pts.forEach((p, i) => { const x = p[0] * W, y = p[1] * H; i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); });
+                ctx.closePath(); ctx.stroke();
+            };
+            poly(S.resp.wall_quad_norm, "#4c8bf5");
+            poly(S.resp.clear_region_quad_norm, "#f5c542");
+            poly(S.artImg || S.resp.placement_quad_norm, "#38d16a");
+            const ctr = S.resp.placement_center_norm;
+            ctx.fillStyle = "#38d16a"; ctx.beginPath();
+            ctx.arc(ctr[0] * W, ctr[1] * H, 4, 0, 7); ctx.fill();
+        }
+
+        function sizeCanvases(imgW, imgH) {
+            const maxW = 1000, scale = Math.min(1, maxW / imgW);
+            const w = Math.round(imgW * scale), h = Math.round(imgH * scale);
+            for (const id of ["gl", "overlay"]) { $(id).width = w; $(id).height = h; $(id).style.width = w + "px"; $(id).style.height = h + "px"; }
+        }
+
+        function readout(r) {
+            $("readout").innerHTML =
+                `<b>Wall face:</b> ${r.wall_width_ft} ft × ${r.wall_height_ft} ft &nbsp;|&nbsp; ` +
+                `<b>Art:</b> ${r.art_width_ft} ft × ${r.art_height_ft} ft &nbsp;|&nbsp; ` +
+                `<b>fitted:</b> ${r.fitted} &nbsp;|&nbsp; <b>used_depth:</b> ${r.used_depth}`;
+        }
+
+        // ── Submit ──────────────────────────────────────────────────────
+        let roomData = null, productData = null;
+        $("roomFile").addEventListener("change", async e => { roomData = await readFile(e.target); });
+        $("productFile").addEventListener("change", async e => { productData = await readFile(e.target); });
+
+        $("submitBtn").addEventListener("click", async () => {
+            try {
+                const key = $("apiKey").value.trim();
+                if (!key) return setStatus("Enter the x-api-key.", "err");
+                if (!roomData) return setStatus("Upload a room image.", "err");
+                if (!productData) return setStatus("Upload a product image.", "err");
+                const maskUrl = $("maskUrl").value.trim();
+                if (!maskUrl) return setStatus("Enter the wall mask URL.", "err");
+
+                const payload = { room_b64: roomData.b64, product_b64: productData.b64, wall_mask_url: maskUrl };
+                const w = parseFloat($("pdWidth").value), l = parseFloat($("pdLength").value);
+                if (w > 0 && l > 0) payload.product_dimensions = { width: w, length: l };
+
+                setStatus("Processing… (first call may load the depth model)", null);
+                $("submitBtn").disabled = true;
+
+                const res = await fetch(ENDPOINT, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json", "x-api-key": key },
+                    body: JSON.stringify(payload),
+                });
+                const data = await res.json();
+                $("raw").textContent = JSON.stringify(data, null, 2);
+                if (!res.ok) throw new Error(data.error || ("HTTP " + res.status));
+
+                // Load textures: room (local), product (local), mask (from response b64)
+                const [roomImg, prodImg] = await Promise.all([loadImage(roomData.dataURL), loadImage(productData.dataURL)]);
+                S.roomTex = makeTexture(roomImg);
+                S.prodTex = makeTexture(prodImg);
+                S.maskTex = null;
+                if (data.wall_mask_b64) {
+                    const maskImg = await loadImage("data:image/png;base64," + data.wall_mask_b64);
+                    S.maskTex = makeTexture(maskImg);
+                }
+                sizeCanvases(roomImg.naturalWidth, roomImg.naturalHeight);
+                initFromResponse(data);
+                readout(data);
+                render();
+                setStatus("Done. Drag to move · scroll to resize.", "ok");
+            } catch (err) {
+                setStatus("Error: " + err.message, "err");
+            } finally {
+                $("submitBtn").disabled = false;
+            }
+        });
+
+        $("cbOcclude").addEventListener("change", render);
+        $("cbOverlay").addEventListener("change", render);
+
+        // ── Drag (plane-space) + resize (wheel) ─────────────────────────
+        const ov = $("overlay");
+        let drag = null;   // {p0:[planeX,planeY], cx0, cy0}
+        function mouseNorm(e) {
+            const r = ov.getBoundingClientRect();
+            return [(e.clientX - r.left) / r.width, (e.clientY - r.top) / r.height];
+        }
+        function pointInQuad(pt, q) {
+            let sign = 0;
+            for (let i = 0; i < 4; i++) {
+                const a = q[i], b = q[(i + 1) % 4];
+                const cross = (b[0] - a[0]) * (pt[1] - a[1]) - (b[1] - a[1]) * (pt[0] - a[0]);
+                const s = Math.sign(cross);
+                if (s !== 0) { if (sign === 0) sign = s; else if (s !== sign) return false; }
+            }
+            return true;
+        }
+        ov.addEventListener("mousedown", e => {
+            if (!S.art || !S.HwallInv || !S.artImg) return;
+            const m = mouseNorm(e);
+            if (!pointInQuad(m, S.artImg)) return;
+            drag = { p0: applyH(S.HwallInv, m), cx0: S.art.cx, cy0: S.art.cy };
+            ov.classList.add("dragging");
+        });
+        window.addEventListener("mousemove", e => {
+            if (!drag) return;
+            const p = applyH(S.HwallInv, mouseNorm(e));
+            S.art.cx = drag.cx0 + (p[0] - drag.p0[0]);
+            S.art.cy = drag.cy0 + (p[1] - drag.p0[1]);
+            clampArt(); render();
+        });
+        window.addEventListener("mouseup", () => { drag = null; ov.classList.remove("dragging"); });
+        ov.addEventListener("wheel", e => {
+            if (!S.art) return;
+            e.preventDefault();
+            const f = e.deltaY < 0 ? 1.05 : 1 / 1.05;
+            S.art.w *= f; S.art.h *= f;
+            if (S.clearBox) {   // don't grow past the clear region
+                S.art.w = Math.min(S.art.w, S.clearBox.x1 - S.clearBox.x0);
+                S.art.h = Math.min(S.art.h, S.clearBox.y1 - S.clearBox.y0);
+            }
+            clampArt(); render();
+        }, { passive: false });
+    </script>
+</body>
+
+</html>
