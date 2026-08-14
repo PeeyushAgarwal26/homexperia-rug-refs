@@ -364,12 +364,15 @@ def _local_names(room_id, url):
     return names
 
 
-def resolve_focal_ratio(width, height, payload=None, room_id=None, url=None, local_dirs=()):
+def resolve_focal_ratio(width, height, payload=None, room_id=None, url=None,
+                        local_dirs=(), probe_files=()):
     """Best available focal ratio for an image, as (ratio, source).
 
     Priority: explicit request value -> cached measurement for this photo ->
-    EXIF re-read from our own upload on disk (survives a process restart, which
-    the in-memory cache does not) -> the legacy 0.8 * max(W, H) guess.
+    EXIF re-read from our own upload on disk -> EXIF from any extra file the
+    caller names (the download cache, for a room hosted elsewhere) -> the legacy
+    0.8 * max(W, H) guess. The two disk routes matter because the in-memory
+    cache does not survive a process restart.
     """
     ratio, source = _from_payload(payload, width, height)
     if ratio:
@@ -389,5 +392,13 @@ def resolve_focal_ratio(width, height, payload=None, room_id=None, url=None, loc
                 remember(ratio, source, room_id=room_id, url=url)
                 return ratio, f"disk:{source}"
             break  # file found but unusable — no point trying other folders
+
+    for path in probe_files:
+        if not path or not os.path.isfile(path):
+            continue
+        ratio, source = focal_ratio_from_file(path, width, height)
+        if ratio:
+            remember(ratio, source, room_id=room_id, url=url)
+            return ratio, f"probe:{source}"
 
     return FALLBACK_FOCAL_RATIO, "fallback(default)"

@@ -77,6 +77,56 @@ except Exception:
     pass
 
 
+# SAM checkpoint. Gitignored (2.4 GB), so it must be fetched per environment —
+# set SAM_CHECKPOINT, or drop the file in the repo root.
+DEFAULT_SAM_CHECKPOINT = "sam_vit_h_4b8939.pth"
+_SAM_URLS = {
+    "vit_h": "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth",
+    "vit_l": "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_l_0b3195.pth",
+    "vit_b": "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth",
+}
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def resolve_sam_checkpoint():
+    """Locate the SAM weights and infer the model type from the filename.
+
+    Searched in order: $SAM_CHECKPOINT, the repo root, the current working
+    directory, ./weights, ./models. Resolving relative to the repo root (not
+    just the CWD, which is all the old hardcoded relative path did) means the
+    server works no matter where it was launched from.
+    """
+    configured = os.getenv("SAM_CHECKPOINT", "").strip()
+    if configured and os.path.isfile(configured):
+        return configured, _sam_model_type(configured)
+
+    name = os.path.basename(configured) if configured else DEFAULT_SAM_CHECKPOINT
+    for folder in (_REPO_ROOT, os.getcwd(),
+                   os.path.join(_REPO_ROOT, "weights"),
+                   os.path.join(_REPO_ROOT, "models")):
+        path = os.path.join(folder, name)
+        if os.path.isfile(path):
+            return path, _sam_model_type(path)
+
+    model_type = _sam_model_type(name)
+    raise FileNotFoundError(
+        f"SAM checkpoint '{name}' not found. Looked in $SAM_CHECKPOINT, "
+        f"{_REPO_ROOT}, {os.getcwd()}, ./weights, ./models.\n"
+        f"Download it with:\n"
+        f"  wget -O {os.path.join(_REPO_ROOT, name)} {_SAM_URLS.get(model_type, _SAM_URLS['vit_h'])}\n"
+        f"or point SAM_CHECKPOINT at an existing copy."
+    )
+
+
+def _sam_model_type(path):
+    """vit_h / vit_l / vit_b from the checkpoint filename."""
+    stem = os.path.basename(path).lower()
+    for tag in ("vit_h", "vit_l", "vit_b"):
+        if tag in stem:
+            return tag
+    return "vit_h"
+
+
 def load_models_if_needed():
     global _models_loaded, processor, segmenter, sam_predictor
     if _models_loaded: return
@@ -90,12 +140,12 @@ def load_models_if_needed():
     segmenter = OneFormerForUniversalSegmentation.from_pretrained("shi-labs/oneformer_ade20k_swin_large").to(device)
 
     # Load SAM
-    sam_checkpoint = "sam_vit_h_4b8939.pth"
-    model_type = "vit_h"
+    sam_checkpoint, model_type = resolve_sam_checkpoint()
+    print(f"➡ [INFO] SAM checkpoint: {sam_checkpoint} ({model_type})")
     sam = sam_model_registry[model_type](checkpoint=sam_checkpoint)
     sam.to(device=device)
     sam_predictor = SamPredictor(sam)
-    
+
     print("✅ [SUCCESS] All Models Loaded Successfully!")
     _models_loaded = True
 

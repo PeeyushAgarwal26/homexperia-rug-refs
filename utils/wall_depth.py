@@ -2,6 +2,8 @@ import cv2
 import numpy as np
 import math
 
+from utils.cvcompat import as_segments
+
 # Auto-repeat scale anchor: tile width ~ canvas_width / 12 (the old production
 # tile size at the frontend's default repeat), as an integer count per wall.
 TARGET_TILES_ACROSS_CANVAS = 12.0
@@ -145,19 +147,17 @@ def _detect_wall_quad(mask_gray, debug_img=None):
         cv2.drawContours(clean_boundary, sig_contours, -1, 255, 1)
         lines = cv2.HoughLinesP(clean_boundary, 1, np.pi / 180, threshold=20, minLineLength=max(40, w//8), maxLineGap=20)
         top_lines, bot_lines = [], []
-        if lines is not None:
-            for line in lines:
-                x1, y1, x2, y2 = line[0]
-                if (max(y1, y2) <= 3 or min(y1, y2) >= H - 4 or max(x1, x2) <= 3 or min(x1, x2) >= W - 4): continue
-                dx, dy = float(x2 - x1), float(y2 - y1)
-                if abs(dx) < 1e-3: continue
-                slope = dy / dx
-                if abs(slope) > 1.0: continue # Reject pure verticals
-                intercept = y1 - slope * x1
-                my = (y1 + y2) / 2.0
-                length = math.hypot(dx, dy)
-                if my < y + h * 0.35: top_lines.append((slope, intercept, length))
-                elif my > y + h * 0.65: bot_lines.append((slope, intercept, length))
+        for x1, y1, x2, y2 in as_segments(lines):
+            if (max(y1, y2) <= 3 or min(y1, y2) >= H - 4 or max(x1, x2) <= 3 or min(x1, x2) >= W - 4): continue
+            dx, dy = float(x2 - x1), float(y2 - y1)
+            if abs(dx) < 1e-3: continue
+            slope = dy / dx
+            if abs(slope) > 1.0: continue # Reject pure verticals
+            intercept = y1 - slope * x1
+            my = (y1 + y2) / 2.0
+            length = math.hypot(dx, dy)
+            if my < y + h * 0.35: top_lines.append((slope, intercept, length))
+            elif my > y + h * 0.65: bot_lines.append((slope, intercept, length))
 
         def _get_avg(line_list):
             if not line_list: return None, None

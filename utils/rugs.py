@@ -4,6 +4,8 @@ import math
 import base64
 import requests
 
+from utils.cvcompat import as_segments
+
 def get_lighting_map(img, blur_k=51):
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     if blur_k % 2 == 0: blur_k += 1
@@ -107,19 +109,18 @@ def _detect_floor_quad(room_img, floor_mask=None):
     )
 
     left_segs, right_segs = [], []
-    if lines_full is not None:
-        for x1_, y1_, x2_, y2_ in lines_full[:, 0]:
-            y1g = y1_ + lower_y0;  y2g = y2_ + lower_y0
-            dx  = float(x2_ - x1_); dy = float(y2g - y1g)
-            if math.hypot(dx, dy) < max(24.0, W * 0.03): continue
-            if abs(dy) < 12.0: continue
-            slope = dy / (dx + 1e-6)
-            if abs(slope) < 0.18 or abs(slope) > 8.0: continue
-            xm = (x1_ + x2_) * 0.5
-            if slope < 0 and xm < W * 0.62:
-                left_segs.append((x1_, y1g, x2_, y2g))
-            elif slope > 0 and xm > W * 0.38:
-                right_segs.append((x1_, y1g, x2_, y2g))
+    for x1_, y1_, x2_, y2_ in as_segments(lines_full):
+        y1g = y1_ + lower_y0;  y2g = y2_ + lower_y0
+        dx  = float(x2_ - x1_); dy = float(y2g - y1g)
+        if math.hypot(dx, dy) < max(24.0, W * 0.03): continue
+        if abs(dy) < 12.0: continue
+        slope = dy / (dx + 1e-6)
+        if abs(slope) < 0.18 or abs(slope) > 8.0: continue
+        xm = (x1_ + x2_) * 0.5
+        if slope < 0 and xm < W * 0.62:
+            left_segs.append((x1_, y1g, x2_, y2g))
+        elif slope > 0 and xm > W * 0.38:
+            right_segs.append((x1_, y1g, x2_, y2g))
 
     # Keep only 15 longest per side — kills curtain/rug noise
     MAX_SEGS = 15
@@ -189,20 +190,19 @@ def _detect_floor_quad(room_img, floor_mask=None):
             minLineLength=max(28, W // 8),
             maxLineGap=max(20, W // 22),
         )
-        if lines_ref is not None:
-            floor_top_y_init = floor_top_y
-            best_score, best_y = 0.0, floor_top_y
-            for x1_, y1_, x2_, y2_ in lines_ref[:, 0]:
-                if abs(y2_ - y1_) > 14: continue
-                length = math.hypot(x2_ - x1_, y2_ - y1_)
-                gy   = int((y1_ + y2_) * 0.5) + ref_lo
-                dist = abs(gy - floor_top_y_init)
-                score = (length / W) * math.exp(-dist / (H * 0.04))
-                if score > best_score:
-                    best_score = score
-                    best_y     = gy
-            if best_score > 0.10:
-                floor_top_y = best_y
+        floor_top_y_init = floor_top_y
+        best_score, best_y = 0.0, floor_top_y
+        for x1_, y1_, x2_, y2_ in as_segments(lines_ref):
+            if abs(y2_ - y1_) > 14: continue
+            length = math.hypot(x2_ - x1_, y2_ - y1_)
+            gy   = int((y1_ + y2_) * 0.5) + ref_lo
+            dist = abs(gy - floor_top_y_init)
+            score = (length / W) * math.exp(-dist / (H * 0.04))
+            if score > best_score:
+                best_score = score
+                best_y     = gy
+        if best_score > 0.10:
+            floor_top_y = best_y
 
     floor_top_y = max(int(H * 0.33), min(int(H * 0.82), floor_top_y))
 

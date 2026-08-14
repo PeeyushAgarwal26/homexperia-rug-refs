@@ -182,13 +182,20 @@ def load_room_data():
     with open(DATA_FILE, 'r') as f:
         return json.load(f)
 
+def image_cache_path(url):
+    """Disk-cache path for a remote image URL. Also where the depth routes look
+    for the photo's EXIF, since cv2's decode drops it."""
+    if not url:
+        return None
+    return os.path.join(CACHE_FOLDER, f"{hashlib.md5(url.encode('utf-8')).hexdigest()}.jpg")
+
 @log_time
 def download_image(url):
     if not url:
         return None
 
     url_hash = hashlib.md5(url.encode('utf-8')).hexdigest()
-    cache_path = os.path.join(CACHE_FOLDER, f"{url_hash}.jpg")
+    cache_path = image_cache_path(url)
 
     # Fast path: already cached, no lock needed
     if os.path.exists(cache_path):
@@ -225,7 +232,13 @@ def download_image(url):
             if img is None:
                 raise ValueError("Could not decode image")
             try:
-                cv2.imwrite(cache_path, img)
+                # Cache the ORIGINAL bytes, not a cv2 re-encode. Keeps the EXIF
+                # block (which is the only way the depth routes can learn this
+                # photo's focal length for an S3-hosted room) and avoids a
+                # second lossy JPEG pass. cv2.imread sniffs content, not the
+                # extension, so the .jpg path is fine for any format.
+                with open(cache_path, 'wb') as cache_file:
+                    cache_file.write(resp.content)
                 cached_size_mb = os.path.getsize(cache_path) / (1024 * 1024)
                 print(f"{LIGHT_GRAY}💾 [CACHED] Saved to disk: {url_hash}.jpg ({cached_size_mb:.2f}MB){RESET}")
                 logging.info(f"[NEW CACHE] Stored image for URL: {url[:60]}...")
@@ -987,6 +1000,7 @@ def rug_visualizer_scene():
             room_id=data.get('room_id') or data.get('roomId'),
             url=room_url,
             local_dirs=(UPLOAD_FOLDER, GENERATED_FOLDER),
+            probe_files=(image_cache_path(room_url),),
         )
         focal_px = camera.focal_px(width, height, focal_ratio)
         print(f"{CYAN}➡ [CAMERA] {camera.describe(focal_ratio, focal_source, width, height)}{RESET}")
@@ -1112,6 +1126,7 @@ def wallart_visualizer_scene():
             room_id=data.get('room_id') or data.get('roomId'),
             url=room_url,
             local_dirs=(UPLOAD_FOLDER, GENERATED_FOLDER),
+            probe_files=(image_cache_path(room_url),),
         )
         print(f"{CYAN}➡ [CAMERA] {camera.describe(focal_ratio, focal_source, width, height)}{RESET}")
 
@@ -1400,4 +1415,4 @@ def catalogue_qr_generation():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 if __name__ == '__main__':
-    app.run(debug=True, host="0.0.0.0", port=3000)
+    app.run(host="0.0.0.0", port=3000)
