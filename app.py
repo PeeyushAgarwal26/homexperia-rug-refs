@@ -79,12 +79,14 @@ def log_time(func):
 
 from utils.curtain import apply_pattern as apply_curtain_pattern
 from utils.rugs import _detect_floor_quad, _floor_quad_from_depth, _room_dims_from_depth, _estimate_floor_masks, _rug_masks_combine, b64_to_cv2, encode_shadow_map_b64, extract_shadow_map, _fit_floor_frame, reference_scale_factor
+from utils.rugs import REFERENCE_PRIORITY as rug_priority
 from utils.floor import apply_pattern as apply_floor_pattern
 # from utils.wall import apply_pattern as apply_wall_pattern
 from utils.wall_depth import apply_pattern as apply_wall_pattern
 from utils.wallart import analyze_wallart_scene
 from utils.pdf_generator import generate_report_pdf
 from utils.segmentation import process_scene_pipeline, get_metric_depth, detect_reference_objects
+from utils.debug_refs import DEBUG_REFERENCES, save_reference_debug   # [DEBUG BLOCK]
 from utils.qr_generator import generate_catalogue_qr
 
 load_dotenv()
@@ -942,6 +944,16 @@ def get_reference_scale(cache_key, room_img, depth_map, focal_px, floor_frame):
     detections = detect_reference_objects(room_img)
     result = reference_scale_factor(depth_map, focal_px, floor_frame, detections)
 
+    # ---------------------------- [DEBUG BLOCK] ----------------------------
+    if DEBUG_REFERENCES:
+        try:
+            debug_key = hashlib.md5(
+                (cache_key[0] if cache_key else 'b64').encode('utf-8')).hexdigest()[:8]
+            save_reference_debug(room_img, detections, result[1], result[0], debug_key)
+        except Exception as debug_err:
+            print(f"{YELLOW}⚠ [REF-DEBUG] Could not write debug images: {debug_err}{RESET}")
+    # --------------------------- [/DEBUG BLOCK] ----------------------------
+
     if cache_key is not None:
         with _reference_cache_lock:
             _reference_cache[cache_key] = result
@@ -1027,16 +1039,28 @@ def rug_visualizer_scene():
                         ref_key = (room_url, tuple(floor_mask_urls)) if room_url else None
                         scale_factor, scale_samples = get_reference_scale(
                             ref_key, room_img, depth_map, focal_px, floor_frame)
+                        marks = {'selected': '✓', 'rejected': '✗',
+                                 'not-selected': '·', 'skipped': '–'}
                         for s in scale_samples:
-                            mark = "✓" if s.get('used') else "✗"
-                            print(f"{CYAN}   {mark} [REF] {s['label']}: measured "
-                                  f"{s.get('measured_ft', '?')} ft vs known {s['known_ft']} ft "
-                                  f"-> x{s.get('scale', '?')}"
-                                  f"{'' if s.get('used') else '  (' + str(s.get('reason')) + ')'}{RESET}")
-                        if scale_factor != 1.0:
-                            print(f"{GREEN}✅ [SCALE] Depth scale corrected by "
-                                  f"x{scale_factor:.3f} from {sum(1 for s in scale_samples if s.get('used'))} "
-                                  f"reference object(s){RESET}")
+                            status = s.get('status', '?')
+                            measured = s.get('measured_ft')
+                            body = (f"measured {measured} ft vs known {s['known_ft']} ft "
+                                    f"-> x{s.get('scale')} (score {s.get('score')})"
+                                    if measured is not None
+                                    else f"not measured (known {s['known_ft']} ft)")
+                            reason = f"  [{s['reason']}]" if s.get('reason') else ""
+                            print(f"{CYAN}   {marks.get(status, '?')} [REF] "
+                                  f"{s['label']} #{s.get('index')}: {body}{reason}{RESET}")
+
+                        winner = next((s for s in scale_samples
+                                       if s.get('status') == 'selected'), None)
+                        if winner is not None:
+                            same_class = sum(1 for s in scale_samples
+                                             if s['label'] == winner['label'])
+                            print(f"{GREEN}✅ [SCALE] x{scale_factor:.3f} from "
+                                  f"{winner['label']} #{winner['index']} "
+                                  f"(best of {same_class} {winner['label']} instance(s); "
+                                  f"priority {' > '.join(rug_priority)}){RESET}")
                         else:
                             print(f"{YELLOW}⚠ [SCALE] No usable reference object; "
                                   f"depth scale left uncorrected{RESET}")
@@ -1055,6 +1079,13 @@ def rug_visualizer_scene():
                     print(f"{CYAN}➡ [DIMENSIONS] {room_width_ft} ft (W) x {room_length_ft} ft (L) | "
                           f"{room_area_sqft} sqft | floor depth {dims['median_depth_m']} m | "
                           f"camera height {dims['camera_height_m']} m{RESET}")
+                    # Camera height is a free cross-check: a real room photo is
+                    # shot from 1.1-1.6 m. Well outside that means the scale is
+                    # wrong, whatever the reference object reported.
+                    if not (0.95 <= dims['camera_height_m'] <= 1.85):
+                        print(f"{YELLOW}⚠ [SANITY] Camera height {dims['camera_height_m']} m is "
+                              f"outside the plausible 1.1-1.6 m for a room photo — "
+                              f"the scale is probably off{RESET}")
                 else:
                     print(f"{YELLOW}⚠ [DIMENSIONS] Could not fit a floor plane for dimensions{RESET}")
             except Exception as e:

@@ -517,18 +517,49 @@ def _room_dims_from_depth(depth_m, floor_mask, focal_px, scale_factor=1.0, frame
 #            'long'  -> the long side. Used for flat vertical objects: a door
 #                       has essentially no footprint, so its floor projection
 #                       collapses to a sliver whose LENGTH is the door's width.
-# weight   : confidence, used when several references disagree. These reflect
-#            how standardized each object actually is: interior doors are
-#            28-36in (~8% spread), but "bed" spans twin (3'3") to king (6'4"),
-#            a 2x range -- so the bed's vote is deliberately the weakest.
+# aspect   : plausible range for footprint_short / footprint_long. Not a hard
+#            reject — it feeds the instance score, so a segment that does not
+#            look like its class loses to one that does. A door's footprint is
+#            a sliver (~0), a bed's is a broad rectangle, a chair's is squarish.
 REFERENCE_OBJECTS = {
-    "door":  {"known_ft": 3.0, "axis": "long",  "weight": 1.0},
-    "chair": {"known_ft": 2.5, "axis": "short", "weight": 0.7},
-    "bed":   {"known_ft": 6.0, "axis": "short", "weight": 0.5},
+    "door":  {"known_ft": 3.0, "axis": "long",  "aspect": (0.00, 0.40)},
+    "chair": {"known_ft": 2.5, "axis": "short", "aspect": (0.55, 1.10)},
+    "bed":   {"known_ft": 6.0, "axis": "short", "aspect": (0.45, 1.10)},
 }
 
-SCALE_MIN, SCALE_MAX = 0.5, 2.0      # never trust a correction beyond 2x
-SAMPLE_MIN, SAMPLE_MAX = 0.35, 2.8   # per-object sanity gate before fusing
+# Priority order. The FIRST class here with a usable instance sets the scale on
+# its own — there is no averaging across classes. A class is only passed over
+# when EVERY instance of it fails to measure (clipped, too few depth pixels,
+# degenerate footprint, or an implausible result).
+REFERENCE_PRIORITY = ("bed", "door", "chair")
+
+# Final backstop on the returned factor.
+SCALE_MIN, SCALE_MAX = 0.5, 2.0
+
+# Per-instance gate. Failing it makes the instance fall through to the next
+# instance, then the next class. This MUST stay inside [SCALE_MIN, SCALE_MAX]:
+# a gate wider than the clamp lets a bad instance be "accepted" and then quietly
+# clamped, which is how an 8.3 ft door (3.0/8.3 = x0.36 -> clamped x0.50) ends
+# up sizing a room instead of being passed over for a better reference.
+# The bound is what the depth model could credibly be wrong by — roughly +-55%.
+# Anything further out is a mis-measurement, not model drift, and returning an
+# uncorrected 1.0 beats acting on it.
+SAMPLE_MIN, SAMPLE_MAX = 0.65, 1.55
+
+# Instance-score weights. With one class deciding alone there is no cross-check,
+# so which INSTANCE is picked matters — these rank them. Set any weight to 0 to
+# drop that signal.
+SCORE_W_COVERAGE = 0.35   # valid depth pixels behind the measurement
+SCORE_W_MARGIN   = 0.30   # clearance from the left/right frame edges
+SCORE_W_NEARNESS = 0.20   # near objects have denser, more reliable depth
+SCORE_W_ASPECT   = 0.15   # does the footprint look like this class should?
+
+SCORE_FULL_COVERAGE = 8000.0   # depth pixels at which coverage scores 1.0
+SCORE_FAR_M = 8.0              # metres beyond the near point at which nearness -> 0
+# Frame clearance scoring full marks. Actual clipping is already a hard reject,
+# so this only has to penalise near-misses — demanding more clearance than this
+# would punish perfectly well-framed objects for sitting off-centre.
+SCORE_FULL_MARGIN = 0.05
 
 
 def _mask_from_bbox(bbox, shape):
@@ -617,82 +648,144 @@ def _measure_reference_object(depth_m, focal_px, frame, obj_mask, axis):
     }
 
 
+def _instance_score(mask, detail, spec, image_w):
+    """How much to trust one instance's measurement, in [0, 1].
+
+    With a single class deciding the scale alone there is no cross-check left,
+    so WHICH instance gets picked matters. Four signals, all pointing the same
+    way -- a big, close, well-framed segment whose footprint looks like its
+    class is worth more than a small, distant, half-occluded one.
+    """
+    cols = np.where(mask.any(axis=0))[0]
+    if len(cols) == 0:
+        return 0.0
+
+    # Clearance from the left/right frame edges. A hard reject already removes
+    # anything actually touching an edge; this prefers what sits well inside.
+    margin = min(int(cols[0]), image_w - 1 - int(cols[-1])) / float(max(1, image_w))
+    margin_score = min(1.0, margin / SCORE_FULL_MARGIN)
+
+    coverage = min(1.0, float(detail.get("points", 0)) / SCORE_FULL_COVERAGE)
+
+    near_m = float(detail.get("median_depth_m", 0.0))
+    nearness = float(np.clip(1.0 - (near_m - 1.0) / SCORE_FAR_M, 0.0, 1.0))
+
+    lo, hi = spec.get("aspect", (0.0, 1.0))
+    long_ft = float(detail.get("footprint_long_ft", 0.0))
+    ratio = float(detail.get("footprint_short_ft", 0.0)) / long_ft if long_ft > 1e-6 else 0.0
+    if lo <= ratio <= hi:
+        aspect = 1.0
+    else:
+        off = (lo - ratio) if ratio < lo else (ratio - hi)
+        aspect = float(max(0.0, 1.0 - off / 0.35))
+
+    return float(SCORE_W_COVERAGE * coverage + SCORE_W_MARGIN * margin_score +
+                 SCORE_W_NEARNESS * nearness + SCORE_W_ASPECT * aspect)
+
+
 def reference_scale_factor(depth_m, focal_px, frame, detections):
-    """Fuse per-object scale votes into ONE multiplier for the depth scale.
+    """ONE reference class sets the depth scale, chosen by priority.
 
-    Each detection votes scale_i = known_ft / measured_ft. Votes combine as a
-    WEIGHTED GEOMETRIC MEAN (an arithmetic mean of logs), because scale errors
-    are multiplicative: a 2x over-read and a 2x under-read must cancel to 1.0,
-    which a plain average would put at 1.25. With three or more votes, a MAD
-    filter in log space drops a disagreeing outlier first.
+    Walks REFERENCE_PRIORITY (bed -> door -> chair). For the first class that is
+    present, every instance is measured and scored, and the best-scoring usable
+    one sets scale = known_ft / measured_ft by itself. Nothing is averaged --
+    not across classes, and not across instances of a class.
 
-    Returns (scale_factor, samples) — samples is a per-object audit trail so a
-    wrong number can be traced to the object that caused it. Falls back to
-    (1.0, samples) whenever nothing usable was found, leaving the depth map
+    A class is only passed over when EVERY instance of it fails: clipped by the
+    frame edge, too few depth pixels, a degenerate footprint, or a scale outside
+    [SAMPLE_MIN, SAMPLE_MAX]. Lower-priority classes are then never measured.
+
+    Returns (scale_factor, samples). Every detection appears in samples with a
+    `status` so a wrong number traces to the object that caused it:
+        selected     - this one set the scale
+        rejected     - measured or gated out (see `reason`)
+        not-selected - usable, but another instance of its class scored higher
+        skipped      - never measured; a higher-priority class already won
+    Returns (1.0, samples) when nothing usable was found, leaving the depth map
     exactly as the model produced it.
     """
     samples = []
     if frame is None or depth_m is None:
         return 1.0, samples
 
-    for det in (detections or []):
-        label = det.get("label")
-        spec = REFERENCE_OBJECTS.get(label)
-        if spec is None:
-            continue
+    by_label = {}
+    for index, det in enumerate(detections or []):
+        if det.get("label") in REFERENCE_OBJECTS:
+            by_label.setdefault(det["label"], []).append((index, det))
 
-        mask = det.get("mask")
-        if mask is None:
-            mask = _mask_from_bbox(det.get("bbox"), depth_m.shape[:2])
-        if mask is None:
-            continue
-
-        measured, detail = _measure_reference_object(
-            depth_m, focal_px, frame, mask, spec["axis"])
-
+    def _stub(index, det, status, reason=None):
         entry = {
-            "label": label,
-            "known_ft": spec["known_ft"],
-            "weight": spec["weight"],
-            "used": False,
+            "index": index,
+            "label": det.get("label"),
+            "known_ft": REFERENCE_OBJECTS[det["label"]]["known_ft"],
+            "status": status,
         }
-        if measured is None:
-            entry["reason"] = detail
-            samples.append(entry)
+        if reason:
+            entry["reason"] = reason
+        return entry
+
+    selected = None
+    for label in REFERENCE_PRIORITY:
+        entries = by_label.get(label)
+        if not entries:
             continue
 
-        scale = spec["known_ft"] / measured
-        entry.update({
-            "measured_ft": round(float(measured), 2),
-            "scale": round(float(scale), 4),
-            **{k: v for k, v in detail.items() if k != "points"},
-        })
-        if not (SAMPLE_MIN <= scale <= SAMPLE_MAX):
-            entry["reason"] = "implausible-scale"
-        else:
-            entry["used"] = True
-        samples.append(entry)
+        spec = REFERENCE_OBJECTS[label]
+        measured_here = []
+        for index, det in entries:
+            mask = det.get("mask")
+            if mask is None:
+                mask = _mask_from_bbox(det.get("bbox"), depth_m.shape[:2])
+            if mask is None:
+                samples.append(_stub(index, det, "rejected", "no-mask-or-bbox"))
+                continue
 
-    used = [s for s in samples if s["used"]]
-    if not used:
+            size_ft, detail = _measure_reference_object(
+                depth_m, focal_px, frame, mask, spec["axis"])
+            if size_ft is None:
+                samples.append(_stub(index, det, "rejected", detail))
+                continue
+
+            scale = spec["known_ft"] / size_ft
+            entry = _stub(index, det, "candidate")
+            entry.update({
+                "measured_ft": round(float(size_ft), 2),
+                "scale": round(float(scale), 4),
+                "score": round(_instance_score(mask, detail, spec, depth_m.shape[1]), 3),
+                "footprint_short_ft": detail["footprint_short_ft"],
+                "footprint_long_ft": detail["footprint_long_ft"],
+                "median_depth_m": detail["median_depth_m"],
+            })
+            if not (SAMPLE_MIN <= scale <= SAMPLE_MAX):
+                entry["status"] = "rejected"
+                entry["reason"] = "implausible-scale"
+            samples.append(entry)
+            measured_here.append(entry)
+
+        usable = [e for e in measured_here if e["status"] == "candidate"]
+        if not usable:
+            continue   # whole class unusable -> fall through to the next one
+
+        best = max(usable, key=lambda e: e["score"])
+        best["status"] = "selected"
+        for entry in usable:
+            if entry is not best:
+                entry["status"] = "not-selected"
+                entry["reason"] = "lower-score-than-{0}".format(best["score"])
+        selected = best
+        break
+
+    # Anything a winning class made unnecessary is reported, not measured.
+    seen = {e["index"] for e in samples}
+    for index, det in enumerate(detections or []):
+        if index not in seen and det.get("label") in REFERENCE_OBJECTS:
+            samples.append(_stub(index, det, "skipped", "higher-priority-class-used"))
+    samples.sort(key=lambda e: e["index"])
+
+    if selected is None:
         return 1.0, samples
+    return float(np.clip(selected["scale"], SCALE_MIN, SCALE_MAX)), samples
 
-    logs = np.array([math.log(s["scale"]) for s in used])
-    wts = np.array([float(s["weight"]) for s in used])
-
-    if len(logs) >= 3:
-        med = float(np.median(logs))
-        mad = float(np.median(np.abs(logs - med))) + 1e-9
-        keep = np.abs(logs - med) <= 2.5 * mad
-        if 0 < int(keep.sum()) < len(logs):
-            for sample, k in zip(used, keep):
-                if not k:
-                    sample["used"] = False
-                    sample["reason"] = "outlier-vs-other-references"
-            logs, wts = logs[keep], wts[keep]
-
-    scale = float(np.exp(float(np.sum(wts * logs) / np.sum(wts))))
-    return float(np.clip(scale, SCALE_MIN, SCALE_MAX)), samples
 
 def _find_nearest_mask_pixel(mask, start_x, start_y, radius=36):
     height, width = mask.shape[:2]
