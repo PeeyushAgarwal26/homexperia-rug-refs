@@ -147,17 +147,18 @@ def _detect_wall_quad(mask_gray, debug_img=None):
         cv2.drawContours(clean_boundary, sig_contours, -1, 255, 1)
         lines = cv2.HoughLinesP(clean_boundary, 1, np.pi / 180, threshold=20, minLineLength=max(40, w//8), maxLineGap=20)
         top_lines, bot_lines = [], []
-        for x1, y1, x2, y2 in as_segments(lines):
-            if (max(y1, y2) <= 3 or min(y1, y2) >= H - 4 or max(x1, x2) <= 3 or min(x1, x2) >= W - 4): continue
-            dx, dy = float(x2 - x1), float(y2 - y1)
-            if abs(dx) < 1e-3: continue
-            slope = dy / dx
-            if abs(slope) > 1.0: continue # Reject pure verticals
-            intercept = y1 - slope * x1
-            my = (y1 + y2) / 2.0
-            length = math.hypot(dx, dy)
-            if my < y + h * 0.35: top_lines.append((slope, intercept, length))
-            elif my > y + h * 0.65: bot_lines.append((slope, intercept, length))
+        if lines is not None:
+            for x1, y1, x2, y2 in as_segments(lines):
+                if (max(y1, y2) <= 3 or min(y1, y2) >= H - 4 or max(x1, x2) <= 3 or min(x1, x2) >= W - 4): continue
+                dx, dy = float(x2 - x1), float(y2 - y1)
+                if abs(dx) < 1e-3: continue
+                slope = dy / dx
+                if abs(slope) > 1.0: continue # Reject pure verticals
+                intercept = y1 - slope * x1
+                my = (y1 + y2) / 2.0
+                length = math.hypot(dx, dy)
+                if my < y + h * 0.35: top_lines.append((slope, intercept, length))
+                elif my > y + h * 0.65: bot_lines.append((slope, intercept, length))
 
         def _get_avg(line_list):
             if not line_list: return None, None
@@ -630,7 +631,7 @@ def _split_counts(total, widths):
         counts[j] += 1
     return counts
 
-def apply_pattern(room_img, wall_tex, mask_img, fallback_repeat=None, depth_map=None, shadow_strength=0.6, focal_ratio=None):
+def apply_pattern(room_img, wall_tex, mask_img, fallback_repeat=None, depth_map=None, shadow_strength=0.6):
     """
     Returns (result_image, auto_repeat) — auto_repeat is the INTEGER total
     repeat chosen by the auto logic (reported back for the frontend's step-1
@@ -653,10 +654,6 @@ def apply_pattern(room_img, wall_tex, mask_img, fallback_repeat=None, depth_map=
     creases give room-corner folds (up to 2 corners / 3 faces, even in one
     singular mask) and each face gets a depth-fitted perspective quad. Every
     depth failure falls back to the 2D pipeline — depth is advisory only.
-
-    focal_ratio: focal_px / max(H, W) for this photograph, from its EXIF where
-    available (see utils/camera.py). Sets the lateral scale of the depth
-    back-projection; defaults to the WALL_FOCAL_RATIO guess when unknown.
     """
     print("[INFO] Processing Wall (Structural Perspective + Corner Split)...")
     H, W = room_img.shape[:2]
@@ -664,8 +661,7 @@ def apply_pattern(room_img, wall_tex, mask_img, fallback_repeat=None, depth_map=
     mask_gray = cv2.resize(mask_gray, (W, H), interpolation=cv2.INTER_NEAREST)
     _, thresh = cv2.threshold(mask_gray, 127, 255, cv2.THRESH_BINARY)
 
-    f_ratio = float(focal_ratio) if focal_ratio else WALL_FOCAL_RATIO
-    planes = _detect_wall_planes(thresh, debug_img=room_img, depth_map=depth_map, focal_px=f_ratio * max(H, W))
+    planes = _detect_wall_planes(thresh, debug_img=room_img, depth_map=depth_map, focal_px=WALL_FOCAL_RATIO * max(H, W))
     if not planes: return room_img, None
 
     try:

@@ -184,16 +184,12 @@ def _find_center(valid, gh, gw, target_ys):
     return int(xs[i]), int(ys[i])
 
 
-def analyze_wallart_scene(room_img, wall_mask, product_img, product_dims_cm=None, depth_map=None, focal_ratio=None):
+def analyze_wallart_scene(room_img, wall_mask, product_img, product_dims_cm=None, depth_map=None):
     """Returns a dict of normalized placement data, or None if no wall face
     could be analyzed. All *_norm values are normalized by the room image
-    dimensions passed in (resolution-independent).
-
-    focal_ratio (focal_px / max(H, W), from the photo's EXIF where available —
-    see utils/camera.py) sets the metric scale of the fitted wall plane, and so
-    the art's real-world size on it. Defaults to the WALL_FOCAL_RATIO guess."""
+    dimensions passed in (resolution-independent)."""
     H, W = room_img.shape[:2]
-    focal_px = (float(focal_ratio) if focal_ratio else WALL_FOCAL_RATIO) * max(H, W)
+    focal_px = WALL_FOCAL_RATIO * max(H, W)
 
     mask = wall_mask
     if len(mask.shape) == 3:

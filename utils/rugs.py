@@ -4,7 +4,7 @@ import math
 import base64
 import requests
 
-from utils.cvcompat import as_segments
+from utils.cvcompat import as_points, as_segments
 
 def get_lighting_map(img, blur_k=51):
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -109,18 +109,19 @@ def _detect_floor_quad(room_img, floor_mask=None):
     )
 
     left_segs, right_segs = [], []
-    for x1_, y1_, x2_, y2_ in as_segments(lines_full):
-        y1g = y1_ + lower_y0;  y2g = y2_ + lower_y0
-        dx  = float(x2_ - x1_); dy = float(y2g - y1g)
-        if math.hypot(dx, dy) < max(24.0, W * 0.03): continue
-        if abs(dy) < 12.0: continue
-        slope = dy / (dx + 1e-6)
-        if abs(slope) < 0.18 or abs(slope) > 8.0: continue
-        xm = (x1_ + x2_) * 0.5
-        if slope < 0 and xm < W * 0.62:
-            left_segs.append((x1_, y1g, x2_, y2g))
-        elif slope > 0 and xm > W * 0.38:
-            right_segs.append((x1_, y1g, x2_, y2g))
+    if lines_full is not None:
+        for x1_, y1_, x2_, y2_ in as_segments(lines_full):
+            y1g = y1_ + lower_y0;  y2g = y2_ + lower_y0
+            dx  = float(x2_ - x1_); dy = float(y2g - y1g)
+            if math.hypot(dx, dy) < max(24.0, W * 0.03): continue
+            if abs(dy) < 12.0: continue
+            slope = dy / (dx + 1e-6)
+            if abs(slope) < 0.18 or abs(slope) > 8.0: continue
+            xm = (x1_ + x2_) * 0.5
+            if slope < 0 and xm < W * 0.62:
+                left_segs.append((x1_, y1g, x2_, y2g))
+            elif slope > 0 and xm > W * 0.38:
+                right_segs.append((x1_, y1g, x2_, y2g))
 
     # Keep only 15 longest per side — kills curtain/rug noise
     MAX_SEGS = 15
@@ -165,10 +166,10 @@ def _detect_floor_quad(room_img, floor_mask=None):
         else:
             clean_mask = mask_proc
 
-        coords = cv2.findNonZero(clean_mask)
+        coords = as_points(cv2.findNonZero(clean_mask))
 
-        if coords is not None:
-            min_y = int(np.min(coords[:, 0, 1]))
+        if len(coords):
+            min_y = int(np.min(coords[:, 1]))
             offset = int(H * 0.02)
             floor_top_y = max(int(H * 0.20), min_y - offset)
     else:
@@ -190,19 +191,20 @@ def _detect_floor_quad(room_img, floor_mask=None):
             minLineLength=max(28, W // 8),
             maxLineGap=max(20, W // 22),
         )
-        floor_top_y_init = floor_top_y
-        best_score, best_y = 0.0, floor_top_y
-        for x1_, y1_, x2_, y2_ in as_segments(lines_ref):
-            if abs(y2_ - y1_) > 14: continue
-            length = math.hypot(x2_ - x1_, y2_ - y1_)
-            gy   = int((y1_ + y2_) * 0.5) + ref_lo
-            dist = abs(gy - floor_top_y_init)
-            score = (length / W) * math.exp(-dist / (H * 0.04))
-            if score > best_score:
-                best_score = score
-                best_y     = gy
-        if best_score > 0.10:
-            floor_top_y = best_y
+        if lines_ref is not None:
+            floor_top_y_init = floor_top_y
+            best_score, best_y = 0.0, floor_top_y
+            for x1_, y1_, x2_, y2_ in as_segments(lines_ref):
+                if abs(y2_ - y1_) > 14: continue
+                length = math.hypot(x2_ - x1_, y2_ - y1_)
+                gy   = int((y1_ + y2_) * 0.5) + ref_lo
+                dist = abs(gy - floor_top_y_init)
+                score = (length / W) * math.exp(-dist / (H * 0.04))
+                if score > best_score:
+                    best_score = score
+                    best_y     = gy
+            if best_score > 0.10:
+                floor_top_y = best_y
 
     floor_top_y = max(int(H * 0.33), min(int(H * 0.82), floor_top_y))
 
@@ -363,45 +365,53 @@ def _floor_quad_from_depth(depth_m, floor_mask, focal_px, image_shape, coverage=
     floor_top_y = float(np.min(quad[:, 1]))
     return quad, floor_top_y
 
-def _room_dims_from_depth(depth_m, floor_mask, focal_px):
-    """Room width / length / area (ft) from a METRIC depth map + floor mask.
+M_TO_FT = 3.280839895
 
-    Back-projects the floor to a 3D point cloud, robustly fits the floor plane,
-    and measures the oriented rectangle that bounds it IN-PLANE (metres -> feet).
-    Reads real 3D geometry, so it is immune to furniture rotation, occlusion and
-    camera pitch -- the things that broke the old furniture-scale + vanishing-
-    point estimate. Returns {width_ft, length_ft, area_sqft, median_depth_m} or
-    None if a floor plane can't be fit.
-    """
-    M_TO_FT = 3.280839895
-    ROOM_MIN, ROOM_MAX = 4.0, 30.0
 
-    if depth_m is None or floor_mask is None:
-        return None
-
+def _backproject(depth_m, mask, focal_px, min_pts=200, max_pts=40000):
+    """Mask pixels -> 3D camera-space points (metres) via the pinhole model.
+    Returns (points Nx3, all valid depths) or (None, None)."""
     H, W = depth_m.shape[:2]
     f = float(focal_px)
     cx, cy = W / 2.0, H / 2.0
 
-    if floor_mask.shape[:2] != (H, W):
-        floor_mask = cv2.resize(floor_mask, (W, H), interpolation=cv2.INTER_NEAREST)
-    ys, xs = np.where(floor_mask > 127)
-    if len(xs) < 200:
-        return None
+    if mask.shape[:2] != (H, W):
+        mask = cv2.resize(mask, (W, H), interpolation=cv2.INTER_NEAREST)
+    ys, xs = np.where(mask > 127)
+    if len(xs) < min_pts:
+        return None, None
 
     Z = depth_m[ys, xs].astype(np.float64)
     ok = np.isfinite(Z) & (Z > 0.1) & (Z < 30.0)
     xs, ys, Z = xs[ok], ys[ok], Z[ok]
-    if len(xs) < 200:
-        return None
+    if len(xs) < min_pts:
+        return None, None
 
-    # Back-project floor pixels to 3D camera coordinates (metres).
     X = (xs - cx) * Z / f
     Y = (ys - cy) * Z / f
     P = np.stack([X, Y, Z], axis=1)
-    if len(P) > 40000:
-        idx = np.linspace(0, len(P) - 1, 40000).astype(np.int64)
+    if len(P) > max_pts:
+        idx = np.linspace(0, len(P) - 1, max_pts).astype(np.int64)
         P = P[idx]
+    return P, Z
+
+
+def _fit_floor_frame(depth_m, floor_mask, focal_px):
+    """Fit the floor plane and build an in-plane coordinate frame.
+
+    Shared by the room-dimension measurement and the reference-object
+    calibration so both read the SAME plane, and it is only fitted once per
+    request. Returns a dict with the plane (center/normal), an orthonormal
+    in-plane basis (u1/u2), the camera-aligned axes the dimensions use
+    (d_lat/d_dep), the plane-inlier points, and every valid floor depth --
+    or None if a plane can't be fit.
+    """
+    if depth_m is None or floor_mask is None:
+        return None
+
+    P, Z_all = _backproject(depth_m, floor_mask, focal_px)
+    if P is None:
+        return None
 
     # Robust floor-plane fit: SVD normal + iterative outlier rejection.
     c = P.mean(axis=0)
@@ -416,6 +426,9 @@ def _room_dims_from_depth(depth_m, floor_mask, focal_px):
         P = P[keep]
         c = P.mean(axis=0)
 
+    if len(P) < 20:
+        return None
+
     # Two orthonormal axes spanning the floor plane.
     n = n / (np.linalg.norm(n) + 1e-9)
     seed = np.array([1.0, 0.0, 0.0]) if abs(n[0]) < 0.9 else np.array([0.0, 0.0, 1.0])
@@ -423,33 +436,263 @@ def _room_dims_from_depth(depth_m, floor_mask, focal_px):
     u1 /= (np.linalg.norm(u1) + 1e-9)
     u2 = np.cross(n, u1)
 
-    if len(P) < 20:
-        return None
-
     forward = np.array([0.0, 0.0, 1.0]) # Camera Optical Axis
     d_depth = forward - (forward @ n) * n # Forward Projected onto the floor plane
-    
-    if np.linalg.norm(d_depth) < 1e-6: d_depth = u1 # Near top-down view -> degenerate  
+
+    if np.linalg.norm(d_depth) < 1e-6: d_depth = u1 # Near top-down view -> degenerate
     d_depth = d_depth / (np.linalg.norm(d_depth) + 1e-9)
-    
+
     d_lat = np.cross(n, d_depth) # In-Plane axis perpendicular to depth
     d_lat = d_lat / (np.linalg.norm(d_lat) + 1e-9)
 
-    lat = (P - c) @ d_lat
-    dep = (P - c) @ d_depth
-    
+    return {
+        "center": c, "normal": n, "u1": u1, "u2": u2,
+        "d_lat": d_lat, "d_depth": d_depth,
+        "points": P, "floor_depths": Z_all,
+        "camera_height_m": float(abs(c @ n)),
+    }
+
+
+def _room_dims_from_depth(depth_m, floor_mask, focal_px, scale_factor=1.0, frame=None):
+    """Room width / length / area (ft) from a METRIC depth map + floor mask.
+
+    Back-projects the floor to a 3D point cloud, robustly fits the floor plane,
+    and measures the oriented rectangle that bounds it IN-PLANE (metres -> feet).
+    Reads real 3D geometry, so it is immune to furniture rotation, occlusion and
+    camera pitch -- the things that broke the old furniture-scale + vanishing-
+    point estimate. Returns {width_ft, length_ft, area_sqft, median_depth_m} or
+    None if a floor plane can't be fit.
+
+    scale_factor: multiplier from the reference-object calibration (see
+    reference_scale_factor). Multiplying BOTH axes is exactly equivalent to
+    rescaling the depth map itself -- scaling depth by s scales X, Y and Z
+    uniformly, leaving the plane normal unchanged and every in-plane extent
+    scaled by s -- which is the right model for a depth-scale error.
+
+    frame: a pre-fitted _fit_floor_frame(); pass it to avoid refitting.
+    """
+    ROOM_MIN, ROOM_MAX = 4.0, 30.0
+
+    if frame is None:
+        frame = _fit_floor_frame(depth_m, floor_mask, focal_px)
+    if frame is None:
+        return None
+
+    P, c = frame["points"], frame["center"]
+    lat = (P - c) @ frame["d_lat"]
+    dep = (P - c) @ frame["d_depth"]
+
     lat_lo, lat_hi = np.percentile(lat, [1, 99]) # Robust Extents (trim outliers)
     dep_lo, dep_hi = np.percentile(dep, [1, 99])
 
-    width_ft = float(np.clip((lat_hi - lat_lo) * M_TO_FT, ROOM_MIN, ROOM_MAX))
-    length_ft = float(np.clip((dep_hi - dep_lo) * M_TO_FT, ROOM_MIN, ROOM_MAX))
+    s = float(scale_factor) if scale_factor and scale_factor > 0 else 1.0
+
+    # Scale in METRES, before the sanity clamp. Clamping first and multiplying
+    # after would let a 2x correction push a clamped 30 ft room out to 60 ft.
+    width_ft = float(np.clip((lat_hi - lat_lo) * M_TO_FT * s, ROOM_MIN, ROOM_MAX))
+    length_ft = float(np.clip((dep_hi - dep_lo) * M_TO_FT * s, ROOM_MIN, ROOM_MAX))
 
     return {
         "width_ft": round(width_ft, 2),
         "length_ft": round(length_ft, 2),
         "area_sqft": round(width_ft * length_ft, 2),
-        "median_depth_m": round(float(np.median(Z)), 2),
+        "median_depth_m": round(float(np.median(frame["floor_depths"])), 2),
+        "applied_scale_factor": round(s, 4),
+        "camera_height_m": round(frame["camera_height_m"] * s, 2),
     }
+
+
+# --------------------------------------------------------------------------- #
+# Reference-object scale calibration
+#
+# Depth-Anything-V2-Metric-Indoor returns metres, but its absolute scale drifts
+# on photos unlike its training set. An object of KNOWN real size in the frame
+# pins that scale down: measure it in the reconstruction, divide the known size
+# by the measured size, and you have the multiplier that corrects the whole map.
+# --------------------------------------------------------------------------- #
+
+# known_ft : the object's real-world size, in feet.
+# axis     : which side of the object's FLOOR FOOTPRINT known_ft refers to.
+#            'short' -> the narrow side (a bed's width, a chair's width).
+#            'long'  -> the long side. Used for flat vertical objects: a door
+#                       has essentially no footprint, so its floor projection
+#                       collapses to a sliver whose LENGTH is the door's width.
+# weight   : confidence, used when several references disagree. These reflect
+#            how standardized each object actually is: interior doors are
+#            28-36in (~8% spread), but "bed" spans twin (3'3") to king (6'4"),
+#            a 2x range -- so the bed's vote is deliberately the weakest.
+REFERENCE_OBJECTS = {
+    "door":  {"known_ft": 3.0, "axis": "long",  "weight": 1.0},
+    "chair": {"known_ft": 2.5, "axis": "short", "weight": 0.7},
+    "bed":   {"known_ft": 6.0, "axis": "short", "weight": 0.5},
+}
+
+SCALE_MIN, SCALE_MAX = 0.5, 2.0      # never trust a correction beyond 2x
+SAMPLE_MIN, SAMPLE_MAX = 0.35, 2.8   # per-object sanity gate before fusing
+
+
+def _mask_from_bbox(bbox, shape):
+    """Filled mask from an [x1, y1, x2, y2] box — lets a detector that returns
+    only boxes (DETR and friends) feed the same measurement path as OneFormer's
+    masks, at the cost of including background inside the box."""
+    if not bbox or len(bbox) < 4:
+        return None
+    H, W = shape[:2]
+    x1, y1, x2, y2 = [int(round(float(v))) for v in bbox[:4]]
+    x1, x2 = max(0, min(x1, x2)), min(W, max(x1, x2))
+    y1, y2 = max(0, min(y1, y2)), min(H, max(y1, y2))
+    if x2 - x1 < 4 or y2 - y1 < 4:
+        return None
+    mask = np.zeros((H, W), np.uint8)
+    mask[y1:y2, x1:x2] = 255
+    return mask
+
+
+def _measure_reference_object(depth_m, focal_px, frame, obj_mask, axis):
+    """Real size of a detected object, in FEET, measured in the floor plane.
+
+    Back-projects the object's mask to 3D, drops its FOOTPRINT onto the fitted
+    floor plane (i.e. discards the height component), and takes the robust
+    extent along the footprint's own principal axes.
+
+    Measuring in the plane rather than from the 2D bounding box is what makes
+    this independent of how the object is turned relative to the camera. A bed
+    rotated 40 degrees has a far wider pixel bbox than a bed facing the camera,
+    yet the same footprint -- and a bbox spans the diagonal, so it would read a
+    5 ft bed as 8 ft. Using the object's own principal axes also means we can
+    ask for its width specifically, instead of whichever side happens to face us.
+
+    Returns (size_ft, detail_dict) or (None, reason).
+    """
+    # A reference running off the LEFT or RIGHT edge of the frame is truncated,
+    # so it always reads narrower than it is — and every measurement here is a
+    # horizontal one. (Touching the top or bottom edge is fine and very common:
+    # a door reaches the ceiling, a near bed runs off the bottom; neither
+    # truncates its width.)
+    if obj_mask.shape[:2] == depth_m.shape[:2]:
+        edge = obj_mask
+    else:
+        edge = cv2.resize(obj_mask, (depth_m.shape[1], depth_m.shape[0]),
+                          interpolation=cv2.INTER_NEAREST)
+    if edge[:, :2].any() or edge[:, -2:].any():
+        return None, "clipped-by-frame-edge"
+
+    P, _ = _backproject(depth_m, obj_mask, focal_px, min_pts=150, max_pts=20000)
+    if P is None:
+        return None, "too-few-depth-pixels"
+
+    # Drop depth flyers. Segmentation edges bleed onto the background, and a
+    # single far pixel would stretch the footprint arbitrarily.
+    Zo = P[:, 2]
+    z_lo, z_hi = np.percentile(Zo, [5, 95])
+    band = (Zo >= z_lo - 0.35) & (Zo <= z_hi + 0.35)
+    P = P[band]
+    if len(P) < 100:
+        return None, "depth-too-noisy"
+
+    # Footprint: coordinates in the floor plane's basis. The component along the
+    # plane normal (the object's height) is simply not used.
+    rel = P - frame["center"]
+    pts = np.stack([rel @ frame["u1"], rel @ frame["u2"]], axis=1)
+
+    # Oriented extents: PCA for the footprint's own axes, percentile trim for
+    # robustness (a minAreaRect would be pinned by its worst outlier).
+    centered = pts - pts.mean(axis=0)
+    _, _, vt = np.linalg.svd(centered, full_matrices=False)
+    e1 = centered @ vt[0]
+    e2 = centered @ vt[1]
+    s1 = float(np.percentile(e1, 98) - np.percentile(e1, 2))
+    s2 = float(np.percentile(e2, 98) - np.percentile(e2, 2))
+
+    long_m, short_m = max(s1, s2), min(s1, s2)
+    chosen_m = long_m if axis == "long" else short_m
+    if chosen_m <= 0.05:
+        return None, "degenerate-footprint"
+
+    return chosen_m * M_TO_FT, {
+        "footprint_short_ft": round(short_m * M_TO_FT, 2),
+        "footprint_long_ft": round(long_m * M_TO_FT, 2),
+        "median_depth_m": round(float(np.median(P[:, 2])), 2),
+        "points": int(len(P)),
+    }
+
+
+def reference_scale_factor(depth_m, focal_px, frame, detections):
+    """Fuse per-object scale votes into ONE multiplier for the depth scale.
+
+    Each detection votes scale_i = known_ft / measured_ft. Votes combine as a
+    WEIGHTED GEOMETRIC MEAN (an arithmetic mean of logs), because scale errors
+    are multiplicative: a 2x over-read and a 2x under-read must cancel to 1.0,
+    which a plain average would put at 1.25. With three or more votes, a MAD
+    filter in log space drops a disagreeing outlier first.
+
+    Returns (scale_factor, samples) — samples is a per-object audit trail so a
+    wrong number can be traced to the object that caused it. Falls back to
+    (1.0, samples) whenever nothing usable was found, leaving the depth map
+    exactly as the model produced it.
+    """
+    samples = []
+    if frame is None or depth_m is None:
+        return 1.0, samples
+
+    for det in (detections or []):
+        label = det.get("label")
+        spec = REFERENCE_OBJECTS.get(label)
+        if spec is None:
+            continue
+
+        mask = det.get("mask")
+        if mask is None:
+            mask = _mask_from_bbox(det.get("bbox"), depth_m.shape[:2])
+        if mask is None:
+            continue
+
+        measured, detail = _measure_reference_object(
+            depth_m, focal_px, frame, mask, spec["axis"])
+
+        entry = {
+            "label": label,
+            "known_ft": spec["known_ft"],
+            "weight": spec["weight"],
+            "used": False,
+        }
+        if measured is None:
+            entry["reason"] = detail
+            samples.append(entry)
+            continue
+
+        scale = spec["known_ft"] / measured
+        entry.update({
+            "measured_ft": round(float(measured), 2),
+            "scale": round(float(scale), 4),
+            **{k: v for k, v in detail.items() if k != "points"},
+        })
+        if not (SAMPLE_MIN <= scale <= SAMPLE_MAX):
+            entry["reason"] = "implausible-scale"
+        else:
+            entry["used"] = True
+        samples.append(entry)
+
+    used = [s for s in samples if s["used"]]
+    if not used:
+        return 1.0, samples
+
+    logs = np.array([math.log(s["scale"]) for s in used])
+    wts = np.array([float(s["weight"]) for s in used])
+
+    if len(logs) >= 3:
+        med = float(np.median(logs))
+        mad = float(np.median(np.abs(logs - med))) + 1e-9
+        keep = np.abs(logs - med) <= 2.5 * mad
+        if 0 < int(keep.sum()) < len(logs):
+            for sample, k in zip(used, keep):
+                if not k:
+                    sample["used"] = False
+                    sample["reason"] = "outlier-vs-other-references"
+            logs, wts = logs[keep], wts[keep]
+
+    scale = float(np.exp(float(np.sum(wts * logs) / np.sum(wts))))
+    return float(np.clip(scale, SCALE_MIN, SCALE_MAX)), samples
 
 def _find_nearest_mask_pixel(mask, start_x, start_y, radius=36):
     height, width = mask.shape[:2]

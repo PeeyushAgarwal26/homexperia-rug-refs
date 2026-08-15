@@ -77,71 +77,32 @@ except Exception:
     pass
 
 
-# SAM checkpoint. Gitignored (2.4 GB), so it must be fetched per environment —
-# set SAM_CHECKPOINT, or drop the file in the repo root.
-DEFAULT_SAM_CHECKPOINT = "sam_vit_h_4b8939.pth"
-_SAM_URLS = {
-    "vit_h": "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth",
-    "vit_l": "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_l_0b3195.pth",
-    "vit_b": "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth",
-}
-_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+def load_oneformer_if_needed():
+    """OneFormer only. Split out from the SAM load so callers that just need
+    panoptic labels — reference-object detection — do not also have to have the
+    2.4 GB SAM checkpoint present."""
+    global processor, segmenter
+    if segmenter is not None: return
 
+    print(f"➡ [INFO] Loading OneFormer to {device.upper()}...")
+    from transformers import OneFormerProcessor, OneFormerForUniversalSegmentation
 
-def resolve_sam_checkpoint():
-    """Locate the SAM weights and infer the model type from the filename.
-
-    Searched in order: $SAM_CHECKPOINT, the repo root, the current working
-    directory, ./weights, ./models. Resolving relative to the repo root (not
-    just the CWD, which is all the old hardcoded relative path did) means the
-    server works no matter where it was launched from.
-    """
-    configured = os.getenv("SAM_CHECKPOINT", "").strip()
-    if configured and os.path.isfile(configured):
-        return configured, _sam_model_type(configured)
-
-    name = os.path.basename(configured) if configured else DEFAULT_SAM_CHECKPOINT
-    for folder in (_REPO_ROOT, os.getcwd(),
-                   os.path.join(_REPO_ROOT, "weights"),
-                   os.path.join(_REPO_ROOT, "models")):
-        path = os.path.join(folder, name)
-        if os.path.isfile(path):
-            return path, _sam_model_type(path)
-
-    model_type = _sam_model_type(name)
-    raise FileNotFoundError(
-        f"SAM checkpoint '{name}' not found. Looked in $SAM_CHECKPOINT, "
-        f"{_REPO_ROOT}, {os.getcwd()}, ./weights, ./models.\n"
-        f"Download it with:\n"
-        f"  wget -O {os.path.join(_REPO_ROOT, name)} {_SAM_URLS.get(model_type, _SAM_URLS['vit_h'])}\n"
-        f"or point SAM_CHECKPOINT at an existing copy."
-    )
-
-
-def _sam_model_type(path):
-    """vit_h / vit_l / vit_b from the checkpoint filename."""
-    stem = os.path.basename(path).lower()
-    for tag in ("vit_h", "vit_l", "vit_b"):
-        if tag in stem:
-            return tag
-    return "vit_h"
+    processor = OneFormerProcessor.from_pretrained("shi-labs/oneformer_ade20k_swin_large")
+    segmenter = OneFormerForUniversalSegmentation.from_pretrained("shi-labs/oneformer_ade20k_swin_large").to(device)
+    print("✅ [SUCCESS] OneFormer loaded.")
 
 
 def load_models_if_needed():
-    global _models_loaded, processor, segmenter, sam_predictor
+    global _models_loaded, sam_predictor
     if _models_loaded: return
 
-    print(f"➡ [INFO] Loading OneFormer & SAM models to {device.upper()}...")
-    from transformers import OneFormerProcessor, OneFormerForUniversalSegmentation
+    load_oneformer_if_needed()
+
+    print(f"➡ [INFO] Loading SAM to {device.upper()}...")
     from segment_anything import sam_model_registry, SamPredictor # type:ignore
 
-    # Load OneFormer
-    processor = OneFormerProcessor.from_pretrained("shi-labs/oneformer_ade20k_swin_large")
-    segmenter = OneFormerForUniversalSegmentation.from_pretrained("shi-labs/oneformer_ade20k_swin_large").to(device)
-
-    # Load SAM
-    sam_checkpoint, model_type = resolve_sam_checkpoint()
-    print(f"➡ [INFO] SAM checkpoint: {sam_checkpoint} ({model_type})")
+    sam_checkpoint = "sam_vit_h_4b8939.pth"
+    model_type = "vit_h"
     sam = sam_model_registry[model_type](checkpoint=sam_checkpoint)
     sam.to(device=device)
     sam_predictor = SamPredictor(sam)
@@ -478,6 +439,90 @@ def postprocess_mask(mask_uint8, image_bgr, image_area, do_edge_refine=True, max
     if do_edge_refine:
         mask_uint8 = refine_mask_edges(mask_uint8, image_bgr)
     return mask_uint8
+
+# Scale-reference objects. The real-world sizes live in
+# utils/rugs.REFERENCE_OBJECTS; this only maps those names onto ADE20k labels.
+# Matching is exact-token (label_matches), so "chair" also picks up
+# "swivel chair" and "armchair" picks up itself, without substring accidents.
+REFERENCE_LABELS = {
+    "bed": {"bed"},
+    "chair": {"chair", "armchair"},
+    "door": {"door"},
+}
+REFERENCE_MIN_AREA = 0.004   # ignore references under 0.4% of the frame
+
+
+def detect_reference_objects(image_cv2, max_dim=1280, min_area_frac=REFERENCE_MIN_AREA):
+    """Find known-size objects (bed / chair / door) for depth-scale calibration.
+
+    Uses the OneFormer model the segmentation pipeline already loads, rather
+    than a remote detector, for three reasons: it is already resident in this
+    process (no API key, no network round-trip, no per-call cost); it returns
+    MASKS, and a bounding box spans a rotated bed's diagonal, which would
+    badly over-read its width; and ADE20k has a `door` class where COCO-trained
+    detectors such as DETR do not -- so on those, a door reference (the most
+    standardized of the three) could never fire at all.
+
+    Returns [{label, ade_label, mask, bbox, area_frac}] with masks at the INPUT
+    image's resolution, so they line up with a full-resolution depth map.
+    """
+    load_oneformer_if_needed()   # SAM is not needed for label-only detection
+
+    H0, W0 = image_cv2.shape[:2]
+    scale = min(1.0, float(max_dim) / float(max(H0, W0)))
+    if scale < 1.0:
+        proc = cv2.resize(image_cv2, (max(1, int(W0 * scale)), max(1, int(H0 * scale))),
+                          interpolation=cv2.INTER_AREA)
+    else:
+        proc = image_cv2
+
+    pil_image = Image.fromarray(cv2.cvtColor(proc, cv2.COLOR_BGR2RGB))
+    inputs = processor(images=pil_image, task_inputs=["panoptic"], return_tensors="pt").to(device)
+    with torch.no_grad():
+        outputs = segmenter(**inputs)
+    result = processor.post_process_panoptic_segmentation(
+        outputs, target_sizes=[pil_image.size[::-1]]
+    )[0]
+
+    seg_map = result["segmentation"].cpu().numpy()
+    id2label = segmenter.config.id2label
+    proc_area = float(seg_map.shape[0] * seg_map.shape[1])
+
+    found = []
+    for segment in result["segments_info"]:
+        model_label = get_label_from_id(id2label, segment["label_id"])
+        canonical = None
+        for name, keywords in REFERENCE_LABELS.items():
+            if label_matches(model_label, keywords):
+                canonical = name
+                break
+        if canonical is None:
+            continue
+
+        seg_bool = (seg_map == segment["id"])
+        area_frac = float(seg_bool.sum()) / proc_area
+        if area_frac < min_area_frac:
+            continue
+
+        rows, cols = np.where(seg_bool)
+        mask = seg_bool.astype(np.uint8) * 255
+        if scale < 1.0:
+            mask = cv2.resize(mask, (W0, H0), interpolation=cv2.INTER_NEAREST)
+
+        found.append({
+            "label": canonical,
+            "ade_label": model_label,
+            "mask": mask,
+            "bbox": [int(cols.min() / scale), int(rows.min() / scale),
+                     int(cols.max() / scale), int(rows.max() / scale)],
+            "area_frac": round(area_frac, 5),
+        })
+
+    summary = ", ".join("{0} ({1})".format(d["label"], d["ade_label"]) for d in found)
+    print("➡ [REFERENCE] Detected {0} scale reference(s): {1}".format(
+        len(found), summary or "none"))
+    return found
+
 
 def process_scene_pipeline(image: Image.Image, room_id: str, filename: str, masks_folder: str, generated_folder: str, server_base_url: str):
     

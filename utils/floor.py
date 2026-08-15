@@ -2,7 +2,7 @@ import cv2
 import numpy as np
 import math
 
-from utils.cvcompat import as_segments
+from utils.cvcompat import as_points, as_segments
 
 def get_lighting_map(img, blur_k=51):
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -63,18 +63,19 @@ def _detect_floor_quad(room_img):
     )
 
     left_segs, right_segs = [], []
-    for x1_, y1_, x2_, y2_ in as_segments(lines_full):
-        y1g = y1_ + lower_y0;  y2g = y2_ + lower_y0
-        dx  = float(x2_ - x1_); dy = float(y2g - y1g)
-        if math.hypot(dx, dy) < max(24.0, W * 0.03): continue
-        if abs(dy) < 12.0: continue
-        slope = dy / (dx + 1e-6)
-        if abs(slope) < 0.18 or abs(slope) > 8.0: continue
-        xm = (x1_ + x2_) * 0.5
-        if slope < 0 and xm < W * 0.62:
-            left_segs.append((x1_, y1g, x2_, y2g))
-        elif slope > 0 and xm > W * 0.38:
-            right_segs.append((x1_, y1g, x2_, y2g))
+    if lines_full is not None:
+        for x1_, y1_, x2_, y2_ in as_segments(lines_full):
+            y1g = y1_ + lower_y0;  y2g = y2_ + lower_y0
+            dx  = float(x2_ - x1_); dy = float(y2g - y1g)
+            if math.hypot(dx, dy) < max(24.0, W * 0.03): continue
+            if abs(dy) < 12.0: continue
+            slope = dy / (dx + 1e-6)
+            if abs(slope) < 0.18 or abs(slope) > 8.0: continue
+            xm = (x1_ + x2_) * 0.5
+            if slope < 0 and xm < W * 0.62:
+                left_segs.append((x1_, y1g, x2_, y2g))
+            elif slope > 0 and xm > W * 0.38:
+                right_segs.append((x1_, y1g, x2_, y2g))
 
     MAX_SEGS = 15
     if len(left_segs) > MAX_SEGS:
@@ -113,19 +114,20 @@ def _detect_floor_quad(room_img):
         minLineLength=max(28, W // 8),
         maxLineGap=max(20, W // 22),
     )
-    floor_top_y_init = floor_top_y
-    best_score, best_y = 0.0, floor_top_y
-    for x1_, y1_, x2_, y2_ in as_segments(lines_ref):
-        if abs(y2_ - y1_) > 14: continue
-        length = math.hypot(x2_ - x1_, y2_ - y1_)
-        gy   = int((y1_ + y2_) * 0.5) + ref_lo
-        dist = abs(gy - floor_top_y_init)
-        score = (length / W) * math.exp(-dist / (H * 0.04))
-        if score > best_score:
-            best_score = score
-            best_y     = gy
-    if best_score > 0.10:
-        floor_top_y = best_y
+    if lines_ref is not None:
+        floor_top_y_init = floor_top_y
+        best_score, best_y = 0.0, floor_top_y
+        for x1_, y1_, x2_, y2_ in as_segments(lines_ref):
+            if abs(y2_ - y1_) > 14: continue
+            length = math.hypot(x2_ - x1_, y2_ - y1_)
+            gy   = int((y1_ + y2_) * 0.5) + ref_lo
+            dist = abs(gy - floor_top_y_init)
+            score = (length / W) * math.exp(-dist / (H * 0.04))
+            if score > best_score:
+                best_score = score
+                best_y     = gy
+        if best_score > 0.10:
+            floor_top_y = best_y
 
     floor_top_y = max(int(H * 0.33), min(int(H * 0.82), floor_top_y))
 
@@ -286,12 +288,12 @@ def apply_pattern(room_img, floor_tex, mask_img, repeat=3, rotation_deg=0, grout
         M_inv = np.linalg.inv(M)
 
         # Calculate dynamic tile scale based on Mask's physical flat width
-        coords = cv2.findNonZero(mask_gray)
+        coords = as_points(cv2.findNonZero(mask_gray))
         if coords is None:
             return room_img
             
         coords_hom = np.ones((len(coords), 3), dtype=np.float32)
-        coords_hom[:, :2] = coords[:, 0, :]
+        coords_hom[:, :2] = coords
         
         flat_hom_scale = (M_inv @ coords_hom.T).T
         valid_mask_scale = flat_hom_scale[:, 2] > 0.001 

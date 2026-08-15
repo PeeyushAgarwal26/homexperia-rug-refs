@@ -29,6 +29,10 @@ _processed_base_cache_lock = threading.Lock()
 _output_cache: dict[tuple, tuple] = {}
 _output_cache_lock = threading.Lock()
 
+# Reference-object depth scale per room: {(room_url, floor_mask_urls): (scale, samples)}
+_reference_cache: dict[tuple, tuple] = {}
+_reference_cache_lock = threading.Lock()
+
 # Per-room metric depth for the wall pipeline: {(room_id, canvas_hw): depth|None}
 # Computed once per room canvas at reduced resolution (metric values are
 # resolution-independent; the wall renderer resizes the map to its canvas).
@@ -73,15 +77,14 @@ def log_time(func):
         return result
     return wrapper
 
-from utils import camera
 from utils.curtain import apply_pattern as apply_curtain_pattern
-from utils.rugs import _detect_floor_quad, _floor_quad_from_depth, _room_dims_from_depth, _estimate_floor_masks, _rug_masks_combine, b64_to_cv2, encode_shadow_map_b64, extract_shadow_map
+from utils.rugs import _detect_floor_quad, _floor_quad_from_depth, _room_dims_from_depth, _estimate_floor_masks, _rug_masks_combine, b64_to_cv2, encode_shadow_map_b64, extract_shadow_map, _fit_floor_frame, reference_scale_factor
 from utils.floor import apply_pattern as apply_floor_pattern
 # from utils.wall import apply_pattern as apply_wall_pattern
 from utils.wall_depth import apply_pattern as apply_wall_pattern
 from utils.wallart import analyze_wallart_scene
 from utils.pdf_generator import generate_report_pdf
-from utils.segmentation import process_scene_pipeline, get_metric_depth
+from utils.segmentation import process_scene_pipeline, get_metric_depth, detect_reference_objects
 from utils.qr_generator import generate_catalogue_qr
 
 load_dotenv()
@@ -182,20 +185,13 @@ def load_room_data():
     with open(DATA_FILE, 'r') as f:
         return json.load(f)
 
-def image_cache_path(url):
-    """Disk-cache path for a remote image URL. Also where the depth routes look
-    for the photo's EXIF, since cv2's decode drops it."""
-    if not url:
-        return None
-    return os.path.join(CACHE_FOLDER, f"{hashlib.md5(url.encode('utf-8')).hexdigest()}.jpg")
-
 @log_time
 def download_image(url):
     if not url:
         return None
 
     url_hash = hashlib.md5(url.encode('utf-8')).hexdigest()
-    cache_path = image_cache_path(url)
+    cache_path = os.path.join(CACHE_FOLDER, f"{url_hash}.jpg")
 
     # Fast path: already cached, no lock needed
     if os.path.exists(cache_path):
@@ -232,13 +228,7 @@ def download_image(url):
             if img is None:
                 raise ValueError("Could not decode image")
             try:
-                # Cache the ORIGINAL bytes, not a cv2 re-encode. Keeps the EXIF
-                # block (which is the only way the depth routes can learn this
-                # photo's focal length for an S3-hosted room) and avoids a
-                # second lossy JPEG pass. cv2.imread sniffs content, not the
-                # extension, so the .jpg path is fine for any format.
-                with open(cache_path, 'wb') as cache_file:
-                    cache_file.write(resp.content)
+                cv2.imwrite(cache_path, img)
                 cached_size_mb = os.path.getsize(cache_path) / (1024 * 1024)
                 print(f"{LIGHT_GRAY}💾 [CACHED] Saved to disk: {url_hash}.jpg ({cached_size_mb:.2f}MB){RESET}")
                 logging.info(f"[NEW CACHE] Stored image for URL: {url[:60]}...")
@@ -546,21 +536,12 @@ def process_single_layer(current_image, layer_data, room_id, prefetched_assets=N
             except Exception as depth_err:
                 print(f"[DEPTH] Unavailable for wall layer: {depth_err}")
 
-            wall_h, wall_w = current_image.shape[:2]
-            focal_ratio, focal_source = camera.resolve_focal_ratio(
-                wall_w, wall_h,
-                room_id=room_id,
-                local_dirs=(UPLOAD_FOLDER,),
-            )
-            print(f"{CYAN}➡ [CAMERA] {camera.describe(focal_ratio, focal_source, wall_w, wall_h)}{RESET}")
-
             processed_image, auto_repeat = apply_wall_pattern(
                 current_image,
                 texture,
                 mask,
                 fallback_repeat=wall_repeat,
-                depth_map=wall_depth,
-                focal_ratio=focal_ratio
+                depth_map=wall_depth
             )
             if auto_repeat is not None:
                 layer_data['settings']['repeat'] = auto_repeat
@@ -767,14 +748,6 @@ def generate_and_segment_curtains():
         new_room_id = str(uuid.uuid4()) # Generate a fresh ID for this new canvas state
         server_base_url = "https://api.homexperia.com"
 
-        # The generated canvas is a re-render of the SAME photograph, so it keeps
-        # the original's intrinsics — the AI output carries no EXIF of its own.
-        camera.inherit(
-            image_url,
-            room_id=new_room_id,
-            url=f"{server_base_url}/uploads/{new_filename}",
-        )
-
         segmentation_result = process_scene_pipeline(
             image=pil_image,
             room_id=new_room_id,
@@ -813,6 +786,10 @@ def reset_room():
         stale_depth = [k for k in _room_depth_cache if k[0] == room_id]
         for k in stale_depth:
             del _room_depth_cache[k]
+    with _reference_cache_lock:
+        stale_refs = [k for k in _reference_cache if room_id in str(k)]
+        for k in stale_refs:
+            del _reference_cache[k]
 
     deleted_count = 0
 
@@ -946,6 +923,30 @@ def _normalize_quad(quad, width, height):
         for x, y in quad.astype(np.float32)
     ]
 
+def get_reference_scale(cache_key, room_img, depth_map, focal_px, floor_frame):
+    """Reference-object depth-scale factor, computed once per (image, floor mask).
+
+    The rug route is hit repeatedly for the same room — once per rug swap — and
+    the factor depends only on the photo and its floor mask, so the OneFormer
+    detection pass and the measurement would otherwise repeat for an identical
+    answer. Caching the finished factor rather than the detections also
+    guarantees every call for a room returns the SAME number: masks are far too
+    large to keep, and re-measuring from cached bounding boxes instead would
+    silently give a different (worse) answer on the second call than the first.
+    """
+    if cache_key is not None:
+        with _reference_cache_lock:
+            if cache_key in _reference_cache:
+                return _reference_cache[cache_key]
+
+    detections = detect_reference_objects(room_img)
+    result = reference_scale_factor(depth_map, focal_px, floor_frame, detections)
+
+    if cache_key is not None:
+        with _reference_cache_lock:
+            _reference_cache[cache_key] = result
+    return result
+
 @app.route('/api/rug-visualizer-scene', methods=['POST'])
 @require_api_key
 def rug_visualizer_scene():
@@ -990,20 +991,7 @@ def rug_visualizer_scene():
             import traceback
             traceback.print_exc()
 
-        # --- Camera intrinsics ---
-        # focal_px sets the lateral scale of every back-projection below, so an
-        # error here scales the reported room width by exactly the same factor.
-        # Real EXIF focal when we can get it; the legacy 0.8 guess otherwise.
-        focal_ratio, focal_source = camera.resolve_focal_ratio(
-            width, height,
-            payload=data,
-            room_id=data.get('room_id') or data.get('roomId'),
-            url=room_url,
-            local_dirs=(UPLOAD_FOLDER, GENERATED_FOLDER),
-            probe_files=(image_cache_path(room_url),),
-        )
-        focal_px = camera.focal_px(width, height, focal_ratio)
-        print(f"{CYAN}➡ [CAMERA] {camera.describe(focal_ratio, focal_source, width, height)}{RESET}")
+        focal_px = 0.8 * max(width, height)
 
         # --- Perspective Correction (rug floor quad) ---
         # Falls back to the geometric quad if depth can't fit a plane.
@@ -1021,16 +1009,52 @@ def rug_visualizer_scene():
                 import traceback
                 traceback.print_exc()
 
-        # --- Room Dimensions (depth-based) ---
+        # --- Room Dimensions (depth-based, calibrated against reference objects) ---
+        scale_factor = 1.0
+        scale_samples = []
         if depth_map is not None:
             try:
-                dims = _room_dims_from_depth(depth_map, visible_floor, focal_px)
+                # Fit the floor plane ONCE; both the calibration and the
+                # dimensions read the same plane.
+                floor_frame = _fit_floor_frame(depth_map, visible_floor, focal_px)
+
+                # Reference-object calibration: find objects of known real size
+                # and use them to correct the depth model's absolute scale.
+                if floor_frame is not None:
+                    try:
+                        # Only cacheable when the room is identified by URL — a
+                        # b64 upload has no stable key to cache against.
+                        ref_key = (room_url, tuple(floor_mask_urls)) if room_url else None
+                        scale_factor, scale_samples = get_reference_scale(
+                            ref_key, room_img, depth_map, focal_px, floor_frame)
+                        for s in scale_samples:
+                            mark = "✓" if s.get('used') else "✗"
+                            print(f"{CYAN}   {mark} [REF] {s['label']}: measured "
+                                  f"{s.get('measured_ft', '?')} ft vs known {s['known_ft']} ft "
+                                  f"-> x{s.get('scale', '?')}"
+                                  f"{'' if s.get('used') else '  (' + str(s.get('reason')) + ')'}{RESET}")
+                        if scale_factor != 1.0:
+                            print(f"{GREEN}✅ [SCALE] Depth scale corrected by "
+                                  f"x{scale_factor:.3f} from {sum(1 for s in scale_samples if s.get('used'))} "
+                                  f"reference object(s){RESET}")
+                        else:
+                            print(f"{YELLOW}⚠ [SCALE] No usable reference object; "
+                                  f"depth scale left uncorrected{RESET}")
+                    except Exception as ref_err:
+                        print(f"{YELLOW}⚠ [SCALE] Reference calibration failed ({ref_err}); "
+                              f"depth scale left uncorrected{RESET}")
+                        import traceback
+                        traceback.print_exc()
+
+                dims = _room_dims_from_depth(depth_map, visible_floor, focal_px,
+                                             scale_factor=scale_factor, frame=floor_frame)
                 if dims is not None:
                     room_width_ft = dims['width_ft']
                     room_length_ft = dims['length_ft']
                     room_area_sqft = dims['area_sqft']
                     print(f"{CYAN}➡ [DIMENSIONS] {room_width_ft} ft (W) x {room_length_ft} ft (L) | "
-                          f"{room_area_sqft} sqft | floor depth {dims['median_depth_m']} m{RESET}")
+                          f"{room_area_sqft} sqft | floor depth {dims['median_depth_m']} m | "
+                          f"camera height {dims['camera_height_m']} m{RESET}")
                 else:
                     print(f"{YELLOW}⚠ [DIMENSIONS] Could not fit a floor plane for dimensions{RESET}")
             except Exception as e:
@@ -1068,7 +1092,8 @@ def rug_visualizer_scene():
             'room_area_sqft': room_area_sqft,
             'room_width_ft': room_width_ft,
             'room_length_ft': room_length_ft,
-            'camera': camera.camera_info(focal_ratio, focal_source, width, height)
+            'scale_factor': round(float(scale_factor), 4),
+            'scale_references': scale_samples
         })
 
     except Exception as e:
@@ -1118,20 +1143,7 @@ def wallart_visualizer_scene():
         except Exception as e:
             print(f"{YELLOW}⚠ [DEPTH] Wallart depth estimation failed ({e}); using 2D detection{RESET}")
 
-        # Real EXIF focal when available (falls back to the legacy 0.8 ratio).
-        # Passed as a RATIO, so it stays correct at the reduced `proc` size.
-        focal_ratio, focal_source = camera.resolve_focal_ratio(
-            width, height,
-            payload=data,
-            room_id=data.get('room_id') or data.get('roomId'),
-            url=room_url,
-            local_dirs=(UPLOAD_FOLDER, GENERATED_FOLDER),
-            probe_files=(image_cache_path(room_url),),
-        )
-        print(f"{CYAN}➡ [CAMERA] {camera.describe(focal_ratio, focal_source, width, height)}{RESET}")
-
-        result = analyze_wallart_scene(proc, wall_mask, product_img, product_dims_cm=product_dims,
-                                       depth_map=depth_map, focal_ratio=focal_ratio)
+        result = analyze_wallart_scene(proc, wall_mask, product_img, product_dims_cm=product_dims, depth_map=depth_map)
         if result is None:
             return jsonify({'error': 'Could not analyze a wall face for placement'}), 422
 
@@ -1147,7 +1159,6 @@ def wallart_visualizer_scene():
             'room_width': width,
             'room_height': height,
             'wall_mask_b64': _encode_png_b64(face_mask),
-            'camera': camera.camera_info(focal_ratio, focal_source, width, height),
         })
         return jsonify(result)
 
@@ -1327,28 +1338,9 @@ def analyze_scene():
 
         filename = f"upload_{room_id}.{ext}"
         img_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-
-        # Keep the EXIF block on disk. The depth routes re-read the focal length
-        # from this file when the in-memory intrinsics cache is cold (a restart),
-        # and PIL only writes EXIF when it is passed explicitly.
-        try:
-            exif_bytes = image.info.get('exif')
-            image.save(img_path, **({'exif': exif_bytes} if exif_bytes else {}))
-        except Exception as exif_err:
-            print(f"{YELLOW}⚠ [WARN] Could not save image with EXIF ({exif_err}); saving without{RESET}")
-            image.save(img_path)
+        image.save(img_path)
 
         server_base_url = "https://api.homexperia.com"
-        image_url = f"{server_base_url}/uploads/{filename}"
-
-        # Read the camera's true focal length ONCE per photograph, here, while
-        # the EXIF is still attached — cv2's decode path in the other routes
-        # strips it. Cached against the room id so the rug / wall / wall-art
-        # depth routes can back-project with real intrinsics instead of the
-        # 0.8 * max(W, H) guess (see utils/camera.py).
-        camera_meta = camera.register_from_pil(image, room_id=room_id, url=image_url)
-        print(f"{CYAN}➡ [CAMERA] Room {room_id}: "
-              f"{camera.describe(camera_meta['focal_ratio'], camera_meta['source'], *image.size)}{RESET}")
 
         print(f"{CYAN}➡ [INFO] Starting automatic scene analysis for Room: {room_id}{RESET}")
         result = process_scene_pipeline(
@@ -1359,10 +1351,6 @@ def analyze_scene():
             generated_folder=app.config['OUTPUT_FOLDER'],
             server_base_url=server_base_url
         )
-
-        # Echoed so the frontend can pass it straight back to the rug / wall-art
-        # scene routes and stay correct even across a server restart.
-        result['camera'] = camera_meta
 
         return jsonify(result)
 
@@ -1415,4 +1403,4 @@ def catalogue_qr_generation():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 if __name__ == '__main__':
-    app.run(host="0.0.0.0", port=3000)
+    app.run(debug=True, host="0.0.0.0", port=3000)
