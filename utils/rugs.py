@@ -278,12 +278,21 @@ def _detect_floor_quad(room_img, floor_mask=None):
 
     return quad, floor_top_y
 
-def _floor_quad_from_depth(depth_m, floor_mask, focal_px, image_shape, coverage=0.98,
+def _floor_quad_from_depth(depth_m, floor_mask, focal_px, image_shape, coverage=0.99,
                            frame=None, scale_factor=1.0):
     """The floor rectangle the client renders rugs on, PLUS its own size in feet.
 
     Returns (quad, floor_top_y, u_span_ft, v_span_ft), where u_span_ft is the
     real length of the TL->TR edge and v_span_ft the TL->BL edge.
+
+    The quad is the camera-aligned BOUNDING BOX of the whole floor mask, taken
+    in the floor plane and projected back through the pinhole model -- so it is
+    still a true floor rectangle (the client's homography stays exact) but it
+    now covers every floor pixel instead of hugging the dense near-camera part.
+    It used to be cv2.minAreaRect over the plane INLIERS, which is a minimum-
+    area box over a point set the sigma-rejection had already eroded; on a real
+    room that lands its far edge well short of the visible floor, and a rug
+    sized against it can never reach the walls.
 
     Why the spans come from here and not from a separate measurement: the client
     normalises rug size against them (hu = rugLength/u_span, hv = rugWidth/u_span,
@@ -310,32 +319,59 @@ def _floor_quad_from_depth(depth_m, floor_mask, focal_px, image_shape, coverage=
     f = float(focal_px)
     cx, cy = W / 2.0, H / 2.0
 
-    P = frame["points"]                      # plane inliers, camera-space metres
-    c, u1, u2 = frame["center"], frame["u1"], frame["u2"]
+    c = frame["center"]
+    d_lat, d_dep = frame["d_lat"], frame["d_depth"]
 
-    A = (P - c) @ u1
-    B = (P - c) @ u2
+    # Measure the extent over EVERY floor-mask point, not the plane inliers.
+    # Points far off the plane are still dropped (segmentation bleed, depth
+    # garbage) but with a fixed physical tolerance instead of a sigma that
+    # tightens each iteration and quietly discards the far floor.
+    P = frame.get("points_all")
+    if P is None or len(P) < 200:
+        P = frame["points"]
+    n = frame["normal"]
+    resid = np.abs((P - c) @ n)
+    tol = max(0.20, 4.0 * float(frame.get("plane_resid_m") or 0.0))
+    on_plane = resid <= tol
+    if on_plane.sum() >= 200:
+        P = P[on_plane]
 
-    lo = max(0.0, (1.0 - coverage) * 50.0) # coverage 0.98 -> [1, 99]
-    a_lo, a_hi = np.percentile(A, [lo, 100 - lo])
-    b_lo, b_hi = np.percentile(B, [lo, 100 - lo])
-    inb = (A >= a_lo) & (A <= a_hi) & (B >= b_lo) & (B <= b_hi)
-    pts2d = np.stack([A[inb], B[inb]], axis=1).astype(np.float32)
-    if len(pts2d) < 20:
+    lat = (P - c) @ d_lat
+    dep = (P - c) @ d_dep
+
+    # Trim only enough to shrug off stragglers. This is a percentile over POINT
+    # COUNT, and perspective packs most pixels into the near floor, so a wide
+    # trim here costs a lot of real floor depth for very little robustness.
+    lo = max(0.0, (1.0 - coverage) * 50.0) # coverage 0.99 -> [0.5, 99.5]
+    a_lo, a_hi = np.percentile(lat, [lo, 100 - lo])
+    b_lo, b_hi = np.percentile(dep, [lo, 100 - lo])
+    if not (a_hi > a_lo and b_hi > b_lo):
         return None
 
-    box = cv2.boxPoints(cv2.minAreaRect(np.ascontiguousarray(pts2d)))  # 4 (a, b) corners
-
     H_img, W_img = image_shape[:2]
-    img = []
-    plane = []   # the SAME four corners, in floor-plane metres
+
+    # A point on the floor plane -> pixel. Zc is linear in (a, b), so a corner
+    # that lands at or behind the horizon is walked back toward the cloud centre
+    # until it projects, instead of failing the whole fit.
+    def _project(a, b, eps=1e-2):
+        for _ in range(24):
+            P3 = c + a * d_lat + b * d_dep
+            Zc = float(P3[2])
+            if Zc > eps:
+                return [cx + f * float(P3[0]) / Zc, cy + f * float(P3[1]) / Zc], a, b
+            a *= 0.85
+            b *= 0.85
+        return None, a, b
+
+    # Corners of the floor mask's camera-aligned bounding box, in the plane.
+    box = [(a_lo, b_hi), (a_hi, b_hi), (a_hi, b_lo), (a_lo, b_lo)]  # far-L, far-R, near-R, near-L
+    img, plane = [], []
     for a, b in box:
-        P3 = c + a * u1 + b * u2 # back to 3D camera coords
-        Zc = float(P3[2])
-        if Zc <= 1e-3:
+        pt, a2, b2 = _project(a, b)
+        if pt is None:
             return None
-        img.append([cx + f * float(P3[0]) / Zc, cy + f * float(P3[1]) / Zc])
-        plane.append([float(a), float(b)])
+        img.append(pt)
+        plane.append([a2, b2])
     img = np.array(img, dtype=np.float32)
     plane = np.array(plane, dtype=np.float64)
 
@@ -349,12 +385,16 @@ def _floor_quad_from_depth(depth_m, floor_mask, focal_px, image_shape, coverage=
     quad = img[idx].astype(np.float32)
     plane_quad = plane[idx]
 
-    # Sanity: non-degenerate and not wildly off-screen.
+    # Sanity: non-degenerate, finite, and the far edge really is above the near
+    # edge. Corners are NOT required to sit near the frame any more -- a quad
+    # that covers the whole floor legitimately runs off the bottom and sides,
+    # and the client's homography extrapolates there perfectly well.
+    if not np.all(np.isfinite(quad)):
+        return None
     if cv2.contourArea(quad) < 0.02 * W_img * H_img:
         return None
-    for x, y in quad:
-        if x < -0.7 * W_img or x > 1.7 * W_img or y < -0.7 * H_img or y > 1.7 * H_img:
-            return None
+    if float(np.mean(quad[:2, 1])) >= float(np.mean(quad[2:, 1])):
+        return None
 
     s = float(scale_factor) if scale_factor and scale_factor > 0 else 1.0
     u_span_ft = float(np.linalg.norm(plane_quad[1] - plane_quad[0]) * M_TO_FT * s)
@@ -411,6 +451,13 @@ def _fit_floor_frame(depth_m, floor_mask, focal_px):
     if P is None:
         return None
 
+    # Every floor-mask point, kept BEFORE outlier rejection. The rejection below
+    # is the right thing for FITTING the plane but the wrong thing for measuring
+    # how far the floor reaches: far-floor pixels are sparse and depth-noisy, so
+    # four rounds of 2.5-sigma trimming eat them, and any extent measured on the
+    # survivors stops short of the floor you can actually see.
+    P_all = P.copy()
+
     # Robust floor-plane fit: SVD normal + iterative outlier rejection.
     c = P.mean(axis=0)
     n = np.array([0.0, 1.0, 0.0])
@@ -426,6 +473,8 @@ def _fit_floor_frame(depth_m, floor_mask, focal_px):
 
     if len(P) < 20:
         return None
+
+    plane_resid_m = float(np.std((P - c) @ (n / (np.linalg.norm(n) + 1e-9))))
 
     # Two orthonormal axes spanning the floor plane.
     n = n / (np.linalg.norm(n) + 1e-9)
@@ -446,7 +495,8 @@ def _fit_floor_frame(depth_m, floor_mask, focal_px):
     return {
         "center": c, "normal": n, "u1": u1, "u2": u2,
         "d_lat": d_lat, "d_depth": d_depth,
-        "points": P, "floor_depths": Z_all,
+        "points": P, "points_all": P_all, "floor_depths": Z_all,
+        "plane_resid_m": plane_resid_m,
         "camera_height_m": float(abs(c @ n)),
     }
 
@@ -1101,16 +1151,64 @@ def _dbg_uv(H, u, v):
     return (x, y)
 
 
-def _dbg_pt(p, lim=30000):
-    """Clamp to a range cv2 can rasterise; it clips the rest to the canvas."""
-    return (int(round(max(-lim, min(lim, p[0])))),
-            int(round(max(-lim, min(lim, p[1])))))
+def quad_floor_coverage(quad, floor_mask):
+    """Fraction of floor-mask pixels that fall inside the quad, 0..1.
+
+    The direct answer to "is the quad big enough?". A quad that covers the floor
+    scores ~1.0; the old minAreaRect-over-inliers quad scores well under that,
+    and the shortfall is exactly the floor a rug can never be sized to reach.
+    """
+    if quad is None or floor_mask is None:
+        return None
+    m = floor_mask
+    if m.ndim == 3:
+        m = cv2.cvtColor(m, cv2.COLOR_BGR2GRAY)
+    total = int((m > 127).sum())
+    if total == 0:
+        return None
+    filled = np.zeros(m.shape[:2], np.uint8)
+    pts = np.asarray(quad, dtype=np.float64).reshape(-1, 2)
+    pts = np.clip(pts, -1e5, 1e5).round().astype(np.int32)
+    cv2.fillPoly(filled, [pts], 255)
+    return float(((filled > 0) & (m > 127)).sum()) / total
+
+
+def _dbg_pt(p):
+    """cv2's anti-aliased rasteriser works in 16.16 fixed point, so coordinates
+    far outside the canvas overflow and smear garbage across the buffer. Every
+    draw call clips to the canvas first (see _dbg_line); this is the backstop."""
+    lim = 12000
+    return (int(round(max(-lim, min(lim, float(p[0]))))),
+            int(round(max(-lim, min(lim, float(p[1]))))))
 
 
 def _dbg_line(canvas, p, q, color, thickness=1):
+    """Clip to the canvas BEFORE rasterising. Drawing a line whose endpoints sit
+    thousands of pixels off-frame is normal here (a floor quad legitimately runs
+    off the bottom and sides) and is what tore the earlier overlays apart."""
     if p is None or q is None:
         return
-    cv2.line(canvas, _dbg_pt(p), _dbg_pt(q), color, thickness, cv2.LINE_AA)
+    if not all(np.isfinite(v) for v in (p[0], p[1], q[0], q[1])):
+        return
+    h, w = canvas.shape[:2]
+    ok, a, b = cv2.clipLine((0, 0, w, h), _dbg_pt(p), _dbg_pt(q))
+    if not ok:
+        return
+    cv2.line(canvas, a, b, color, thickness, cv2.LINE_AA)
+
+
+def _dbg_arrow(canvas, p, q, color, thickness=3):
+    """Arrow, but only when both ends are close enough to the canvas that the
+    head lands somewhere meaningful; otherwise fall back to a clipped line."""
+    if p is None or q is None:
+        return
+    h, w = canvas.shape[:2]
+    inside = lambda pt: -w <= pt[0] <= 2 * w and -h <= pt[1] <= 2 * h
+    if inside(p) and inside(q):
+        cv2.arrowedLine(canvas, _dbg_pt(p), _dbg_pt(q), color, thickness,
+                        cv2.LINE_AA, tipLength=0.03)
+    else:
+        _dbg_line(canvas, p, q, color, thickness)
 
 
 def _dbg_uv_polyline(canvas, H, pts_uv, color, thickness=1, closed=False):
@@ -1139,12 +1237,20 @@ def _dbg_text_block(canvas, lines, org=(14, 14), scale=0.52, pad=8, line_h=22):
 
 
 def _dbg_label(canvas, text, at, color, scale=0.55):
-    if at is None:
+    """Skip labels whose anchor is off-canvas — drawing them is pointless and
+    the out-of-range rectangle/putText is another way to corrupt the buffer."""
+    if at is None or not all(np.isfinite(v) for v in (at[0], at[1])):
         return
+    h, w = canvas.shape[:2]
     x, y = _dbg_pt(at)
+    if not (-200 <= x <= w + 200 and 0 <= y <= h + 40):
+        return
+    x = max(2, min(x, w - 12))
+    y = max(16, min(y, h - 4))
     font = cv2.FONT_HERSHEY_SIMPLEX
     (tw, th), _ = cv2.getTextSize(text, font, scale, 2)
-    cv2.rectangle(canvas, (x - 3, y - th - 5), (x + tw + 3, y + 4), (16, 16, 16), -1)
+    cv2.rectangle(canvas, (max(0, x - 3), max(0, y - th - 5)),
+                  (min(w - 1, x + tw + 3), min(h - 1, y + 4)), (16, 16, 16), -1)
     cv2.putText(canvas, text, (x, y), font, scale, color, 1, cv2.LINE_AA)
 
 
@@ -1250,14 +1356,12 @@ def render_floor_quad_debug(room_img, quad, u_span_ft, v_span_ft,
     # --- u / v axes with their measured lengths ------------------------------
     tl, tr, bl = _dbg_uv(Hm, 0, 0), _dbg_uv(Hm, 1, 0), _dbg_uv(Hm, 0, 1)
     if tl and tr:
-        cv2.arrowedLine(canvas, _dbg_pt(tl), _dbg_pt(tr), _DBG["u_axis"], 3,
-                        cv2.LINE_AA, tipLength=0.03)
+        _dbg_arrow(canvas, tl, tr, _DBG["u_axis"], 3)
         mid = _dbg_uv(Hm, 0.5, 0.0)
         _dbg_label(canvas, f"u -> room_width_ft = {u_span_ft:.2f} ft",
                    (mid[0] - 90, mid[1] - 14) if mid else None, _DBG["u_axis"])
     if tl and bl:
-        cv2.arrowedLine(canvas, _dbg_pt(tl), _dbg_pt(bl), _DBG["v_axis"], 3,
-                        cv2.LINE_AA, tipLength=0.03)
+        _dbg_arrow(canvas, tl, bl, _DBG["v_axis"], 3)
         mid = _dbg_uv(Hm, 0.0, 0.5)
         _dbg_label(canvas, f"v -> room_length_ft = {v_span_ft:.2f} ft",
                    (mid[0] + 12, mid[1]) if mid else None, _DBG["v_axis"])
@@ -1284,6 +1388,8 @@ def render_floor_quad_debug(room_img, quad, u_span_ft, v_span_ft,
     bot_w = float(np.linalg.norm(quad[2] - quad[3]))
     taper = (top_w / bot_w) if bot_w > 1e-6 else 0.0
 
+    cov = quad_floor_coverage(quad, visible_floor)
+
     lines = [
         (f"quad source     : {quad_source}", _DBG["ok"] if src_ok else _DBG["warn"]),
         (f"u span (width)  : {u_span_ft:.2f} ft", _DBG["u_axis"]),
@@ -1293,6 +1399,14 @@ def render_floor_quad_debug(room_img, quad, u_span_ft, v_span_ft,
         (f"quad taper      : {taper:.3f}  (top/bottom edge, in px)", _DBG["text"]),
         (f"rug preview rot : {rot:g} deg  at u={u:g} v={v:g}", _DBG["rug"]),
     ]
+    if cov is not None:
+        lines.insert(1, (f"floor covered   : {cov*100:.1f}% of the floor mask",
+                         _DBG["ok"] if cov >= 0.90 else _DBG["warn"]))
+        if cov < 0.90:
+            lines.append((f"WARNING: quad misses {(1-cov)*100:.0f}% of the floor - a rug",
+                          _DBG["warn"]))
+            lines.append(("         sized against it cannot reach the walls.",
+                          _DBG["warn"]))
     if not src_ok:
         lines.append(("WARNING: 2D fallback quad - its real size is unknown,",
                       _DBG["warn"]))

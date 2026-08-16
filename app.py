@@ -78,7 +78,7 @@ def log_time(func):
     return wrapper
 
 from utils.curtain import apply_pattern as apply_curtain_pattern
-from utils.rugs import _detect_floor_quad, _floor_quad_from_depth, _room_dims_from_depth, _estimate_floor_masks, _rug_masks_combine, b64_to_cv2, encode_shadow_map_b64, extract_shadow_map, _fit_floor_frame, reference_scale_factor, render_floor_quad_debug
+from utils.rugs import _detect_floor_quad, _floor_quad_from_depth, _room_dims_from_depth, _estimate_floor_masks, _rug_masks_combine, b64_to_cv2, encode_shadow_map_b64, extract_shadow_map, _fit_floor_frame, reference_scale_factor, render_floor_quad_debug, quad_floor_coverage
 from utils.rugs import REFERENCE_PRIORITY as rug_priority
 from utils.floor import apply_pattern as apply_floor_pattern
 # from utils.wall import apply_pattern as apply_wall_pattern
@@ -1013,6 +1013,7 @@ def rug_visualizer_scene():
         # separate measurements rescales every rug by their disagreement.
         persp_quad, persp_top_y = floor_quad, floor_top_y
         quad_source = "2d_fallback"
+        quad_coverage = None
 
         # --- Room Dimensions (depth-based, calibrated against reference objects) ---
         scale_factor = 1.0
@@ -1076,9 +1077,16 @@ def rug_visualizer_scene():
                         room_width_ft = round(quad_w_ft, 2)
                         room_length_ft = round(quad_l_ft, 2)
                         room_area_sqft = round(room_width_ft * room_length_ft, 2)
+                        quad_coverage = quad_floor_coverage(persp_quad, visible_floor)
+                        cov_txt = f"{quad_coverage*100:.1f}%" if quad_coverage is not None else "n/a"
                         print(f"{GREEN}✅ [PERSPECTIVE] Depth floor quad | u axis "
                               f"{room_width_ft} ft x v axis {room_length_ft} ft "
-                              f"(vAxisScale {room_width_ft / max(room_length_ft, 1e-6):.3f}){RESET}")
+                              f"(vAxisScale {room_width_ft / max(room_length_ft, 1e-6):.3f}) "
+                              f"| covers {cov_txt} of the floor mask{RESET}")
+                        if quad_coverage is not None and quad_coverage < 0.90:
+                            print(f"{YELLOW}⚠ [PERSPECTIVE] Quad misses "
+                                  f"{(1-quad_coverage)*100:.0f}% of the floor mask — a rug sized "
+                                  f"against it cannot reach the walls{RESET}")
                     else:
                         print(f"{YELLOW}⚠ [PERSPECTIVE] Depth quad fit failed; keeping geometric "
                               f"quad — its real size is UNKNOWN, so rug scale will be off{RESET}")
@@ -1127,10 +1135,13 @@ def rug_visualizer_scene():
 
         # One line per request, always: the quad and the spans that must agree
         # with it. Enough to spot a bad scene in prod logs without the overlay.
+        if quad_coverage is None:
+            quad_coverage = quad_floor_coverage(persp_quad, visible_floor)
         print(f"{PURPLE}➡ [QUAD/{quad_source}] norm={[[round(x, 4), round(y, 4)] for x, y in quad_norm]} "
               f"| u={room_width_ft} ft v={room_length_ft} ft "
               f"| vAxisScale={room_width_ft / max(room_length_ft, 1e-6):.3f} "
-              f"| scale_factor=x{scale_factor:.3f}{RESET}")
+              f"| scale_factor=x{scale_factor:.3f} "
+              f"| floor covered={'n/a' if quad_coverage is None else f'{quad_coverage*100:.1f}%'}{RESET}")
 
         # --- Visual debugger --------------------------------------------------
         # Opt-in per request ("debug": true) or globally via RUG_VISUALIZER_DEBUG=1.
@@ -1189,6 +1200,8 @@ def rug_visualizer_scene():
             'room_width_ft': room_width_ft,
             'room_length_ft': room_length_ft,
             'quad_source': quad_source,
+            'quad_floor_coverage': (None if quad_coverage is None
+                                    else round(float(quad_coverage), 4)),
             'scale_factor': round(float(scale_factor), 4),
             # Underscore-prefixed keys are internal (debug-overlay drawing data)
             'scale_references': [
