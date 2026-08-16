@@ -278,53 +278,40 @@ def _detect_floor_quad(room_img, floor_mask=None):
 
     return quad, floor_top_y
 
-def _floor_quad_from_depth(depth_m, floor_mask, focal_px, image_shape, coverage=0.98):
-    if depth_m is None or floor_mask is None:
+def _floor_quad_from_depth(depth_m, floor_mask, focal_px, image_shape, coverage=0.98,
+                           frame=None, scale_factor=1.0):
+    """The floor rectangle the client renders rugs on, PLUS its own size in feet.
+
+    Returns (quad, floor_top_y, u_span_ft, v_span_ft), where u_span_ft is the
+    real length of the TL->TR edge and v_span_ft the TL->BL edge.
+
+    Why the spans come from here and not from a separate measurement: the client
+    normalises rug size against them (hu = rugLength/u_span, hv = rugWidth/u_span,
+    vAxisScale = u_span/v_span) and then maps the result through THIS quad. The
+    two therefore have to describe one rectangle. Measuring the spans off the
+    corners actually being returned -- in the same plane frame, under the same
+    scale_factor the dimensions use -- is what makes that true. Deriving them
+    independently (a second plane fit, a different in-plane basis, or a scale
+    correction applied to one and not the other) rescales every rug by exactly
+    however much the two estimates disagree.
+
+    frame: a pre-fitted _fit_floor_frame(); pass it to avoid refitting.
+    scale_factor: the reference-object depth correction, applied exactly as
+    _room_dims_from_depth applies it. Scaling depth uniformly leaves the
+    projected pixel corners untouched and scales every in-plane extent, so the
+    quad is unchanged and only its measured size moves.
+    """
+    if frame is None:
+        frame = _fit_floor_frame(depth_m, floor_mask, focal_px)
+    if frame is None:
         return None
 
     H, W = depth_m.shape[:2]
     f = float(focal_px)
     cx, cy = W / 2.0, H / 2.0
 
-    if floor_mask.shape[:2] != (H, W):
-        floor_mask = cv2.resize(floor_mask, (W, H), interpolation=cv2.INTER_NEAREST)
-    ys, xs = np.where(floor_mask > 127)
-    if len(xs) < 200:
-        return None
-
-    Z = depth_m[ys, xs].astype(np.float64)
-    ok = np.isfinite(Z) & (Z > 0.1) & (Z < 30.0)
-    xs, ys, Z = xs[ok], ys[ok], Z[ok]
-    if len(xs) < 200:
-        return None
-
-    # Back-project floor pixels to 3D camera coordinates.
-    X = (xs - cx) * Z / f
-    Y = (ys - cy) * Z / f
-    P = np.stack([X, Y, Z], axis=1)
-    if len(P) > 40000:
-        idx = np.linspace(0, len(P) - 1, 40000).astype(np.int64)
-        P = P[idx]
-
-    # Robust floor-plane fit: SVD normal + iterative outlier rejection.
-    c = P.mean(axis=0)
-    n = np.array([0.0, 1.0, 0.0])
-    for _ in range(4):
-        _, _, vt = np.linalg.svd(P - c, full_matrices=False)
-        n = vt[-1]
-        dist = (P - c) @ n
-        keep = np.abs(dist) <= (2.5 * float(np.std(dist)) + 1e-9)
-        if keep.sum() < 50:
-            break
-        P = P[keep]
-        c = P.mean(axis=0)
-
-    # Two orthonormal axes spanning the floor plane.
-    n = n / (np.linalg.norm(n) + 1e-9)
-    seed = np.array([1.0, 0.0, 0.0]) if abs(n[0]) < 0.9 else np.array([0.0, 0.0, 1.0])
-    u1 = seed - (seed @ n) * n
-    u1 /= (np.linalg.norm(u1) + 1e-9)
-    u2 = np.cross(n, u1)
+    P = frame["points"]                      # plane inliers, camera-space metres
+    c, u1, u2 = frame["center"], frame["u1"], frame["u2"]
 
     A = (P - c) @ u1
     B = (P - c) @ u2
@@ -341,19 +328,26 @@ def _floor_quad_from_depth(depth_m, floor_mask, focal_px, image_shape, coverage=
 
     H_img, W_img = image_shape[:2]
     img = []
+    plane = []   # the SAME four corners, in floor-plane metres
     for a, b in box:
         P3 = c + a * u1 + b * u2 # back to 3D camera coords
         Zc = float(P3[2])
         if Zc <= 1e-3:
             return None
         img.append([cx + f * float(P3[0]) / Zc, cy + f * float(P3[1]) / Zc])
+        plane.append([float(a), float(b)])
     img = np.array(img, dtype=np.float32)
+    plane = np.array(plane, dtype=np.float64)
 
     # Order corners TL, TR, BR, BL (sort by y into top/bottom pairs, then by x).
-    order = img[np.argsort(img[:, 1])]
-    top = order[:2][np.argsort(order[:2, 0])]
-    bot = order[2:][np.argsort(order[2:, 0])]
-    quad = np.array([top[0], top[1], bot[1], bot[0]], dtype=np.float32)
+    # Sort INDICES rather than the array so `plane` follows `img` into the same
+    # order and the spans below are measured on the corners we actually return.
+    order = np.argsort(img[:, 1])
+    top = order[:2][np.argsort(img[order[:2], 0])]
+    bot = order[2:][np.argsort(img[order[2:], 0])]
+    idx = [int(top[0]), int(top[1]), int(bot[1]), int(bot[0])]
+    quad = img[idx].astype(np.float32)
+    plane_quad = plane[idx]
 
     # Sanity: non-degenerate and not wildly off-screen.
     if cv2.contourArea(quad) < 0.02 * W_img * H_img:
@@ -362,8 +356,12 @@ def _floor_quad_from_depth(depth_m, floor_mask, focal_px, image_shape, coverage=
         if x < -0.7 * W_img or x > 1.7 * W_img or y < -0.7 * H_img or y > 1.7 * H_img:
             return None
 
+    s = float(scale_factor) if scale_factor and scale_factor > 0 else 1.0
+    u_span_ft = float(np.linalg.norm(plane_quad[1] - plane_quad[0]) * M_TO_FT * s)
+    v_span_ft = float(np.linalg.norm(plane_quad[3] - plane_quad[0]) * M_TO_FT * s)
+
     floor_top_y = float(np.min(quad[:, 1]))
-    return quad, floor_top_y
+    return quad, floor_top_y, u_span_ft, v_span_ft
 
 M_TO_FT = 3.280839895
 
@@ -1043,3 +1041,274 @@ def _rug_masks_combine(mask_urls):
     if combined_mask is not None:
         combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_CLOSE, kernel)
     return combined_mask
+
+
+# --------------------------------------------------------------------------- #
+# Floor-quad visual debugger
+#
+# floor_quad_norm is not an annotation the client draws — it IS the coordinate
+# system every rug lives in. The client feeds it to computeHomography() and each
+# rug vertex is applyH(H, u, v). So the only way to see whether a rug is being
+# sized correctly is to look at the quad the same way the client does.
+#
+# Everything below reproduces the client's own math (geometry.js) rather than
+# using cv2.getPerspectiveTransform, so what is drawn is what the browser draws.
+# --------------------------------------------------------------------------- #
+
+_DBG = {
+    "quad":    (0, 255, 255),    # yellow  - the quad edges
+    "corner":  (0, 200, 255),    # amber   - corner dots + labels
+    "u_axis":  (90, 240, 110),   # green   - u axis (TL->TR), spans u_span_ft
+    "v_axis":  (255, 170, 60),   # blue    - v axis (TL->BL), spans v_span_ft
+    "ft_grid": (255, 90, 220),   # magenta - the 1-foot grid
+    "rug":     (60, 60, 255),    # red     - reference rug footprints
+    "floor":   (60, 220, 60),    # green   - visible-floor mask tint
+    "warn":    (0, 90, 255),     # orange  - warnings
+    "ok":      (120, 255, 120),
+    "text":    (245, 245, 245),
+}
+
+
+def _dbg_homography(quad):
+    """Port of geometry.js computeHomography(). quad = [TL, TR, BR, BL] pixels."""
+    d0, d1, d2, d3 = [np.asarray(p, dtype=np.float64) for p in quad]
+    dx1, dy1 = d1[0] - d2[0], d1[1] - d2[1]
+    dx2, dy2 = d3[0] - d2[0], d3[1] - d2[1]
+    sx = d0[0] - d1[0] + d2[0] - d3[0]
+    sy = d0[1] - d1[1] + d2[1] - d3[1]
+    det = dx1 * dy2 - dy1 * dx2
+    if abs(det) < 1e-12:
+        return None
+    g = (sx * dy2 - sy * dx2) / det
+    h = (dx1 * sy - dy1 * sx) / det
+    return (
+        d1[0] - d0[0] + g * d1[0], d3[0] - d0[0] + h * d3[0], d0[0],
+        d1[1] - d0[1] + g * d1[1], d3[1] - d0[1] + h * d3[1], d0[1],
+        g, h, 1.0,
+    )
+
+
+def _dbg_uv(H, u, v):
+    """Port of geometry.js applyH(). None when the point is at/behind the
+    horizon (w <= 0), which is where the projection blows up."""
+    w = H[6] * u + H[7] * v + H[8]
+    if w <= 1e-9:
+        return None
+    x = (H[0] * u + H[1] * v + H[2]) / w
+    y = (H[3] * u + H[4] * v + H[5]) / w
+    if not (np.isfinite(x) and np.isfinite(y)):
+        return None
+    return (x, y)
+
+
+def _dbg_pt(p, lim=30000):
+    """Clamp to a range cv2 can rasterise; it clips the rest to the canvas."""
+    return (int(round(max(-lim, min(lim, p[0])))),
+            int(round(max(-lim, min(lim, p[1])))))
+
+
+def _dbg_line(canvas, p, q, color, thickness=1):
+    if p is None or q is None:
+        return
+    cv2.line(canvas, _dbg_pt(p), _dbg_pt(q), color, thickness, cv2.LINE_AA)
+
+
+def _dbg_uv_polyline(canvas, H, pts_uv, color, thickness=1, closed=False):
+    """Draw a uv-space polyline through the homography, dropping any segment
+    that crosses the horizon instead of letting it whip across the frame."""
+    pts = [_dbg_uv(H, u, v) for u, v in pts_uv]
+    seq = pts + [pts[0]] if closed else pts
+    for a, b in zip(seq, seq[1:]):
+        _dbg_line(canvas, a, b, color, thickness)
+
+
+def _dbg_text_block(canvas, lines, org=(14, 14), scale=0.52, pad=8, line_h=22):
+    """Left-aligned text on a dark plate. lines = [(text, color), ...]."""
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    widths = [cv2.getTextSize(t, font, scale, 1)[0][0] for t, _ in lines]
+    box_w = max(widths) + pad * 2
+    box_h = len(lines) * line_h + pad * 2
+    x0, y0 = org
+    overlay = canvas.copy()
+    cv2.rectangle(overlay, (x0, y0), (x0 + box_w, y0 + box_h), (16, 16, 16), -1)
+    cv2.addWeighted(overlay, 0.72, canvas, 0.28, 0, canvas)
+    cv2.rectangle(canvas, (x0, y0), (x0 + box_w, y0 + box_h), (70, 70, 70), 1)
+    for i, (text, color) in enumerate(lines):
+        cv2.putText(canvas, text, (x0 + pad, y0 + pad + line_h * (i + 1) - 6),
+                    font, scale, color, 1, cv2.LINE_AA)
+
+
+def _dbg_label(canvas, text, at, color, scale=0.55):
+    if at is None:
+        return
+    x, y = _dbg_pt(at)
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    (tw, th), _ = cv2.getTextSize(text, font, scale, 2)
+    cv2.rectangle(canvas, (x - 3, y - th - 5), (x + tw + 3, y + 4), (16, 16, 16), -1)
+    cv2.putText(canvas, text, (x, y), font, scale, color, 1, cv2.LINE_AA)
+
+
+def _dbg_rug_uv(u, v, rot_deg, hu, hv, v_axis_scale):
+    """Port of geometry.js rugCornersPx() — the uv corners of a rug, including
+    the rotation/vAxisScale composition the client uses."""
+    rad = math.radians(rot_deg)
+    cos, sin = math.cos(rad), math.sin(rad)
+    return [(lx * cos - ly * sin + u, (lx * sin + ly * cos) * v_axis_scale + v)
+            for lx, ly in ((-hu, -hv), (hu, -hv), (hu, hv), (-hu, hv))]
+
+
+def render_floor_quad_debug(room_img, quad, u_span_ft, v_span_ft,
+                            visible_floor=None, quad_source="depth",
+                            rug_previews=((5.0, 7.0), (9.0, 12.0)),
+                            u=0.48, v=0.76, rot=0.0, max_dim=1700, notes=None):
+    """Overlay showing exactly what the client will do with floor_quad_norm.
+
+    quad         : [TL, TR, BR, BL] in room_img pixels (the persp_quad sent out).
+    u_span_ft    : real length of the TL->TR edge  (becomes room_width_ft).
+    v_span_ft    : real length of the TL->BL edge  (becomes room_length_ft).
+    rug_previews : (width_ft, length_ft) footprints drawn with the client's math.
+
+    Read it like this:
+
+      * The MAGENTA 1-foot grid is the contract test. Each cell is one square
+        foot on the floor. If the quad and the spans agree, the cells read as
+        real floor tiles receding into the scene — square-ish and level near the
+        camera, evenly compressing toward the far edge. If the cells look
+        stretched, sheared, or the tiling is obviously too coarse/fine against
+        real furniture, the spans do not describe this quad and every rug is
+        being scaled by that same error.
+
+      * The RED rug footprints are drawn with the client's own sizing math. A
+        9 x 12 ft rug should look like a 9 x 12 ft rug next to the furniture.
+
+      * The YELLOW quad is the plane itself. Its far edge should sit at the
+        floor/wall junction and its near edge at (or below) the frame bottom.
+        A far edge floating up the wall means the rug's far end is on the wall.
+    """
+    canvas = room_img.copy()
+    if canvas.ndim == 2:
+        canvas = cv2.cvtColor(canvas, cv2.COLOR_GRAY2BGR)
+    H_img, W_img = canvas.shape[:2]
+
+    # Dim the photo so the overlay reads clearly.
+    canvas = (canvas.astype(np.float32) * 0.62).astype(np.uint8)
+
+    # Visible-floor mask tint — this is also the destination-in clip the client
+    # applies, so anything outside it is erased from the rug.
+    if visible_floor is not None:
+        m = visible_floor
+        if m.ndim == 3:
+            m = cv2.cvtColor(m, cv2.COLOR_BGR2GRAY)
+        if m.shape[:2] != (H_img, W_img):
+            m = cv2.resize(m, (W_img, H_img), interpolation=cv2.INTER_NEAREST)
+        tint = np.zeros_like(canvas)
+        tint[:] = _DBG["floor"]
+        alpha = (m > 127).astype(np.float32)[..., None] * 0.16
+        canvas = (canvas * (1 - alpha) + tint * alpha).astype(np.uint8)
+
+    quad = np.asarray(quad, dtype=np.float64).reshape(4, 2)
+    Hm = _dbg_homography(quad)
+    if Hm is None:
+        _dbg_text_block(canvas, [("DEGENERATE QUAD - homography is singular", _DBG["warn"])])
+        return canvas
+
+    u_span_ft = float(u_span_ft) if u_span_ft and u_span_ft > 0 else 0.0
+    v_span_ft = float(v_span_ft) if v_span_ft and v_span_ft > 0 else 0.0
+
+    # --- 1-foot physical grid: the contract test -----------------------------
+    if u_span_ft > 0 and v_span_ft > 0:
+        du, dv = 1.0 / u_span_ft, 1.0 / v_span_ft
+        n_u, n_v = int(math.floor(u_span_ft)), int(math.floor(v_span_ft))
+        for i in range(1, n_u + 1):
+            uu = i * du
+            if uu >= 1.0:
+                break
+            _dbg_uv_polyline(canvas, Hm, [(uu, t / 24.0) for t in range(25)],
+                             _DBG["ft_grid"], 1)
+        for j in range(1, n_v + 1):
+            vv = j * dv
+            if vv >= 1.0:
+                break
+            _dbg_uv_polyline(canvas, Hm, [(t / 24.0, vv) for t in range(25)],
+                             _DBG["ft_grid"], 1)
+        # Mark every 5 ft along the near edge so the scale is countable.
+        for i in range(5, n_u + 1, 5):
+            _dbg_label(canvas, f"{i}ft", _dbg_uv(Hm, i * du, 0.985), _DBG["ft_grid"], 0.45)
+
+    # --- The quad itself -----------------------------------------------------
+    _dbg_uv_polyline(canvas, Hm, [(0, 0), (1, 0), (1, 1), (0, 1)],
+                     _DBG["quad"], 3, closed=True)
+
+    for (uu, vv), name in zip(((0, 0), (1, 0), (1, 1), (0, 1)),
+                              ("TL", "TR", "BR", "BL")):
+        p = _dbg_uv(Hm, uu, vv)
+        if p is None:
+            continue
+        cv2.circle(canvas, _dbg_pt(p), 8, _DBG["corner"], -1, cv2.LINE_AA)
+        _dbg_label(canvas, f"{name} ({uu},{vv})", (p[0] + 12, p[1]), _DBG["corner"], 0.5)
+
+    # --- u / v axes with their measured lengths ------------------------------
+    tl, tr, bl = _dbg_uv(Hm, 0, 0), _dbg_uv(Hm, 1, 0), _dbg_uv(Hm, 0, 1)
+    if tl and tr:
+        cv2.arrowedLine(canvas, _dbg_pt(tl), _dbg_pt(tr), _DBG["u_axis"], 3,
+                        cv2.LINE_AA, tipLength=0.03)
+        mid = _dbg_uv(Hm, 0.5, 0.0)
+        _dbg_label(canvas, f"u -> room_width_ft = {u_span_ft:.2f} ft",
+                   (mid[0] - 90, mid[1] - 14) if mid else None, _DBG["u_axis"])
+    if tl and bl:
+        cv2.arrowedLine(canvas, _dbg_pt(tl), _dbg_pt(bl), _DBG["v_axis"], 3,
+                        cv2.LINE_AA, tipLength=0.03)
+        mid = _dbg_uv(Hm, 0.0, 0.5)
+        _dbg_label(canvas, f"v -> room_length_ft = {v_span_ft:.2f} ft",
+                   (mid[0] + 12, mid[1]) if mid else None, _DBG["v_axis"])
+
+    # --- Reference rugs, drawn with the CLIENT's sizing math -----------------
+    v_axis_scale = (u_span_ft / v_span_ft) if v_span_ft > 0 else 1.0
+    if u_span_ft > 0:
+        for rug_w_ft, rug_l_ft in (rug_previews or ()):
+            hu = (rug_l_ft / u_span_ft) / 2.0        # geometry.js: hu from LENGTH
+            hv = (rug_w_ft / u_span_ft) / 2.0        # geometry.js: hv from WIDTH
+            pts_uv = _dbg_rug_uv(u, v, rot, hu, hv, v_axis_scale)
+            _dbg_uv_polyline(canvas, Hm, pts_uv, _DBG["rug"], 3, closed=True)
+            # Label on the rug's own near edge (midpoint of BR-BL) so it tracks
+            # the footprint instead of floating at a fixed pixel offset.
+            near = _dbg_uv(Hm, (pts_uv[2][0] + pts_uv[3][0]) / 2.0,
+                               (pts_uv[2][1] + pts_uv[3][1]) / 2.0)
+            _dbg_label(canvas, f"{rug_w_ft:g} x {rug_l_ft:g} ft",
+                       (near[0] - 40, near[1] - 8) if near else None,
+                       _DBG["rug"], 0.6)
+
+    # --- Info panel ----------------------------------------------------------
+    src_ok = quad_source == "depth"
+    top_w = float(np.linalg.norm(quad[1] - quad[0]))
+    bot_w = float(np.linalg.norm(quad[2] - quad[3]))
+    taper = (top_w / bot_w) if bot_w > 1e-6 else 0.0
+
+    lines = [
+        (f"quad source     : {quad_source}", _DBG["ok"] if src_ok else _DBG["warn"]),
+        (f"u span (width)  : {u_span_ft:.2f} ft", _DBG["u_axis"]),
+        (f"v span (length) : {v_span_ft:.2f} ft", _DBG["v_axis"]),
+        (f"vAxisScale      : {v_axis_scale:.3f}   (client clamps this!)", _DBG["text"]),
+        (f"image           : {W_img} x {H_img} px", _DBG["text"]),
+        (f"quad taper      : {taper:.3f}  (top/bottom edge, in px)", _DBG["text"]),
+        (f"rug preview rot : {rot:g} deg  at u={u:g} v={v:g}", _DBG["rug"]),
+    ]
+    if not src_ok:
+        lines.append(("WARNING: 2D fallback quad - its real size is unknown,",
+                      _DBG["warn"]))
+        lines.append(("         so the spans above do NOT describe it.", _DBG["warn"]))
+    if abs(taper - 0.55) < 0.02:
+        lines.append(("WARNING: taper == 0.55 -> hard-coded _detect_floor_quad shape",
+                      _DBG["warn"]))
+    if v_axis_scale > 6.0 or v_axis_scale < 1 / 6.0:
+        lines.append((f"WARNING: vAxisScale {v_axis_scale:.2f} exceeds the client clamp",
+                      _DBG["warn"]))
+    for note in (notes or []):
+        lines.append((note, _DBG["text"]))
+    _dbg_text_block(canvas, lines)
+
+    if max_dim and max(W_img, H_img) > max_dim:
+        s = max_dim / float(max(W_img, H_img))
+        canvas = cv2.resize(canvas, (int(W_img * s), int(H_img * s)),
+                            interpolation=cv2.INTER_AREA)
+    return canvas
