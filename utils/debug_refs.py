@@ -39,6 +39,8 @@ _STATUS_COLOUR = {
     "skipped":      (150, 150, 150),   # grey   - a higher-priority class won
 }
 _DEFAULT_COLOUR = (200, 120, 200)
+_KNOWN_COLOUR = (245, 245, 245)    # the "this is what known_ft looks like" bar
+_RULER_COLOUR = (235, 225, 90)     # 1 ft ticks in corrected feet
 
 
 def _draw_label(canvas, x, y, lines, colour, scale):
@@ -62,20 +64,80 @@ def _draw_label(canvas, x, y, lines, colour, scale):
 
 
 def _summary_lines(sample):
-    """Two compact lines describing one reference."""
+    """Compact lines describing one reference."""
     head = "{0} #{1}  {2}".format(sample.get("label", "?"),
                                   sample.get("index", "?"),
                                   str(sample.get("status", "?")).upper())
     if sample.get("measured_ft") is not None:
-        detail = "{0} ft vs {1} ft  x{2}  score {3}".format(
-            sample.get("measured_ft"), sample.get("known_ft"),
-            sample.get("scale"), sample.get("score"))
+        detail = "{0} ft measured vs {1} ft known  ->  x{2}".format(
+            sample.get("measured_ft"), sample.get("known_ft"), sample.get("scale"))
+        extra = "footprint {0} x {1} ft ({2} axis)  {3} m away  score {4}".format(
+            sample.get("footprint_short_ft"), sample.get("footprint_long_ft"),
+            sample.get("measured_axis", "?"), sample.get("median_depth_m"),
+            sample.get("score"))
+        lines = [head, detail, extra]
     else:
-        detail = "not measured ({0} ft expected)".format(sample.get("known_ft"))
-    lines = [head, detail]
+        lines = [head, "not measured ({0} ft expected)".format(sample.get("known_ft"))]
     if sample.get("reason"):
         lines.append(str(sample["reason"]))
     return lines
+
+
+def _scaled(points, view_scale):
+    """Geometry arrives in room-image pixels; the overlay may be downscaled."""
+    return [(int(round(px * view_scale)), int(round(py * view_scale)))
+            for px, py in points]
+
+
+def _draw_measurement(canvas, geom, sample, colour, view_scale, font_scale, is_selected):
+    """Draw the EXACT geometry the scale correction was computed from:
+
+      thin quad   the object's footprint where it meets the floor plane
+      thick bar   the span that was measured and compared against known_ft
+      white bar   what known_ft actually looks like, same axis, same start
+      ruler       1 ft ticks in CORRECTED feet, for eyeballing real sizes
+    """
+    if not geom:
+        return
+
+    foot = geom.get("footprint_px")
+    if foot:
+        pts = np.array(_scaled(foot, view_scale), np.int32)
+        cv2.polylines(canvas, [pts], True, colour, max(1, int(canvas.shape[1] / 1100)))
+
+    measured = geom.get("measured_px")
+    if measured:
+        (ax, ay), (bx, by) = _scaled(measured, view_scale)
+        thick = max(3, int(canvas.shape[1] / 420))
+        cv2.line(canvas, (ax, ay), (bx, by), colour, thick, cv2.LINE_AA)
+        for cx_, cy_ in ((ax, ay), (bx, by)):
+            cv2.circle(canvas, (cx_, cy_), thick + 2, colour, -1, cv2.LINE_AA)
+        _draw_label(canvas, (ax + bx) // 2, (ay + by) // 2,
+                    ["MEASURED {0} ft".format(sample.get("measured_ft"))],
+                    colour, font_scale)
+
+    known = geom.get("known_px")
+    if known:
+        (ax, ay), (bx, by) = _scaled(known, view_scale)
+        thick = max(2, int(canvas.shape[1] / 600))
+        cv2.line(canvas, (ax, ay), (bx, by), _KNOWN_COLOUR, thick, cv2.LINE_AA)
+        for cx_, cy_ in ((ax, ay), (bx, by)):
+            cv2.circle(canvas, (cx_, cy_), thick + 2, _KNOWN_COLOUR, -1, cv2.LINE_AA)
+        _draw_label(canvas, (ax + bx) // 2, (ay + by) // 2,
+                    ["KNOWN {0} ft".format(sample.get("known_ft"))],
+                    _KNOWN_COLOUR, font_scale)
+
+    # The ruler is the payoff — only worth drawing for the object that won.
+    if is_selected:
+        for tick in geom.get("ruler_px") or []:
+            (ax, ay), (bx, by) = _scaled([tick["a"], tick["b"]], view_scale)
+            whole = tick["ft"] % 2 == 0
+            cv2.line(canvas, (ax, ay), (bx, by), _RULER_COLOUR,
+                     max(1, int(canvas.shape[1] / (900 if whole else 1400))), cv2.LINE_AA)
+            if whole:
+                cv2.putText(canvas, "{0}ft".format(tick["ft"]), (bx + 4, by + 4),
+                            cv2.FONT_HERSHEY_SIMPLEX, font_scale * 0.8,
+                            _RULER_COLOUR, max(1, int(font_scale * 1.6)), cv2.LINE_AA)
 
 
 def save_reference_debug(room_img, detections, samples, scale_factor, key,
@@ -124,6 +186,9 @@ def save_reference_debug(room_img, detections, samples, scale_factor, key,
 
     for contours, colour, sample, x, y, w, h in outlines:
         cv2.drawContours(canvas, contours, -1, colour, max(2, int(W / 700)))
+        # The measurement geometry sits on top of the silhouette.
+        _draw_measurement(canvas, sample.get("_geom"), sample, colour, view_scale,
+                          font_scale, sample.get("status") == "selected")
         # Label below the object when there is no room above it.
         lines = _summary_lines(sample)
         above = y - int(28 * font_scale * len(lines)) - 10
@@ -133,11 +198,12 @@ def save_reference_debug(room_img, detections, samples, scale_factor, key,
     selected = next((s for s in (samples or []) if s.get("status") == "selected"), None)
     header = [
         "SCALE x{0:.3f}".format(float(scale_factor)),
-        "from: {0}".format("{0} #{1} ({2} ft vs {3} ft)".format(
+        "from: {0}".format("{0} #{1} ({2} ft measured -> {3} ft known)".format(
             selected.get("label"), selected.get("index"),
             selected.get("measured_ft"), selected.get("known_ft"))
             if selected else "no usable reference - depth left uncorrected"),
         "priority: bed > door > chair",
+        "thick bar = measured span   white bar = known size   yellow = 1ft ticks",
     ]
     _draw_label(canvas, 10, 10, header,
                 (60, 200, 60) if selected else (40, 190, 235), font_scale * 1.15)

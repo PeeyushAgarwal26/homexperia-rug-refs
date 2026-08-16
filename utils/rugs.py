@@ -579,7 +579,79 @@ def _mask_from_bbox(bbox, shape):
     return mask
 
 
-def _measure_reference_object(depth_m, focal_px, frame, obj_mask, axis):
+def _plane_to_pixel(frame, ab, focal_px, shape):
+    """A point given in floor-plane (u1, u2) coordinates -> image pixel.
+
+    The inverse of the back-projection: lift (a, b) back to a 3D point ON the
+    floor plane, then apply the pinhole projection. Used only to draw what was
+    measured; nothing in the measurement depends on it.
+    """
+    P3 = frame["center"] + float(ab[0]) * frame["u1"] + float(ab[1]) * frame["u2"]
+    Zc = float(P3[2])
+    if Zc <= 1e-6:
+        return None
+    H, W = shape[:2]
+    return [round(W / 2.0 + focal_px * float(P3[0]) / Zc, 1),
+            round(H / 2.0 + focal_px * float(P3[1]) / Zc, 1)]
+
+
+def _measurement_geometry(frame, mean2, basis, extents, measured_idx,
+                          known_ft, focal_px, shape):
+    """Image-space drawing data for EXACTLY what the measurement used.
+
+    Returns the footprint rectangle as it lies on the floor, the span that was
+    actually compared against known_ft, a bar of the KNOWN length along the same
+    axis (so the two can be eyeballed side by side — their ratio IS the scale
+    correction), and a 1-foot tick ruler in CORRECTED feet.
+    """
+    (lo0, hi0), (lo1, hi1) = extents
+    v0, v1 = basis
+
+    def px(ab):
+        return _plane_to_pixel(frame, ab, focal_px, shape)
+
+    corners = []
+    for s0, s1 in ((lo0, lo1), (hi0, lo1), (hi0, hi1), (lo0, hi1)):
+        point = px(mean2 + s0 * v0 + s1 * v1)
+        if point is None:
+            return None
+        corners.append(point)
+
+    # Split into the axis that was measured and the one across it.
+    v_m, (lo_m, hi_m) = (v0, (lo0, hi0)) if measured_idx == 0 else (v1, (lo1, hi1))
+    v_o, (lo_o, hi_o) = (v1, (lo1, hi1)) if measured_idx == 0 else (v0, (lo0, hi0))
+
+    span_o = max(1e-6, hi_o - lo_o)
+    gap = 0.18 * span_o          # keep the measured and known bars apart
+    mid_o = 0.5 * (lo_o + hi_o)
+
+    measured = [px(mean2 + lo_m * v_m + (mid_o - gap) * v_o),
+                px(mean2 + hi_m * v_m + (mid_o - gap) * v_o)]
+
+    known = None
+    ruler = []
+    if known_ft:
+        known_m = float(known_ft) / M_TO_FT
+        known = [px(mean2 + lo_m * v_m + (mid_o + gap) * v_o),
+                 px(mean2 + (lo_m + known_m) * v_m + (mid_o + gap) * v_o)]
+
+        # One corrected foot = (measured span) / known_ft raw metres, since that
+        # span is DEFINED to be known_ft feet once the correction is applied.
+        step = (hi_m - lo_m) / float(known_ft)
+        for k in range(-2, int(known_ft) + 4):
+            a = lo_m + k * step
+            tick_a = px(mean2 + a * v_m + (hi_o + 0.20 * span_o) * v_o)
+            tick_b = px(mean2 + a * v_m + (hi_o + 0.55 * span_o) * v_o)
+            if tick_a and tick_b:
+                ruler.append({"a": tick_a, "b": tick_b, "ft": k})
+
+    if any(p is None for p in measured) or (known and any(p is None for p in known)):
+        return None
+    return {"footprint_px": corners, "measured_px": measured,
+            "known_px": known, "ruler_px": ruler}
+
+
+def _measure_reference_object(depth_m, focal_px, frame, obj_mask, axis, known_ft=None):
     """Real size of a detected object, in FEET, measured in the floor plane.
 
     Back-projects the object's mask to 3D, drops its FOOTPRINT onto the fitted
@@ -628,23 +700,32 @@ def _measure_reference_object(depth_m, focal_px, frame, obj_mask, axis):
 
     # Oriented extents: PCA for the footprint's own axes, percentile trim for
     # robustness (a minAreaRect would be pinned by its worst outlier).
-    centered = pts - pts.mean(axis=0)
+    mean2 = pts.mean(axis=0)
+    centered = pts - mean2
     _, _, vt = np.linalg.svd(centered, full_matrices=False)
-    e1 = centered @ vt[0]
-    e2 = centered @ vt[1]
-    s1 = float(np.percentile(e1, 98) - np.percentile(e1, 2))
-    s2 = float(np.percentile(e2, 98) - np.percentile(e2, 2))
+    lo0, hi0 = np.percentile(centered @ vt[0], [2, 98])
+    lo1, hi1 = np.percentile(centered @ vt[1], [2, 98])
+    s0, s1 = float(hi0 - lo0), float(hi1 - lo1)
 
-    long_m, short_m = max(s1, s2), min(s1, s2)
+    long_m, short_m = max(s0, s1), min(s0, s1)
     chosen_m = long_m if axis == "long" else short_m
     if chosen_m <= 0.05:
         return None, "degenerate-footprint"
+
+    # Which of the two principal axes ended up being the measured one.
+    if axis == "long":
+        measured_idx = 0 if s0 >= s1 else 1
+    else:
+        measured_idx = 0 if s0 < s1 else 1
 
     return chosen_m * M_TO_FT, {
         "footprint_short_ft": round(short_m * M_TO_FT, 2),
         "footprint_long_ft": round(long_m * M_TO_FT, 2),
         "median_depth_m": round(float(np.median(P[:, 2])), 2),
         "points": int(len(P)),
+        "geometry": _measurement_geometry(
+            frame, mean2, (vt[0], vt[1]), ((lo0, hi0), (lo1, hi1)),
+            measured_idx, known_ft, focal_px, depth_m.shape),
     }
 
 
@@ -741,7 +822,7 @@ def reference_scale_factor(depth_m, focal_px, frame, detections):
                 continue
 
             size_ft, detail = _measure_reference_object(
-                depth_m, focal_px, frame, mask, spec["axis"])
+                depth_m, focal_px, frame, mask, spec["axis"], spec["known_ft"])
             if size_ft is None:
                 samples.append(_stub(index, det, "rejected", detail))
                 continue
@@ -755,6 +836,10 @@ def reference_scale_factor(depth_m, focal_px, frame, detections):
                 "footprint_short_ft": detail["footprint_short_ft"],
                 "footprint_long_ft": detail["footprint_long_ft"],
                 "median_depth_m": detail["median_depth_m"],
+                "measured_axis": spec["axis"],
+                # Underscore-prefixed: drawing data for the debug overlay only,
+                # stripped from the API response by the route.
+                "_geom": detail.get("geometry"),
             })
             if not (SAMPLE_MIN <= scale <= SAMPLE_MAX):
                 entry["status"] = "rejected"

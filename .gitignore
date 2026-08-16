@@ -18,6 +18,7 @@ generated/
 image_cache/
 geometry-debug/
 homeexperia-frontend/
+*_Debugs/
 
 flask.log
 error.log

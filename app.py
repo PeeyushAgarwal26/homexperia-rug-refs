@@ -1125,7 +1125,11 @@ def rug_visualizer_scene():
             'room_width_ft': room_width_ft,
             'room_length_ft': room_length_ft,
             'scale_factor': round(float(scale_factor), 4),
-            'scale_references': scale_samples
+            # Underscore-prefixed keys are internal (debug-overlay drawing data)
+            'scale_references': [
+                {k: v for k, v in s.items() if not k.startswith('_')}
+                for s in scale_samples
+            ]
         })
 
     except Exception as e:
