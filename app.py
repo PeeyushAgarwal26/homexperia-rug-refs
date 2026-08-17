@@ -1293,20 +1293,30 @@ def wallart_tester_page():
 
 @app.route('/uploads/<filename>')
 def serve_uploads(filename):
-    return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
+    response = send_from_directory(app.config['UPLOAD_FOLDER'], filename)
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    return response
 
 @app.route('/generated/<filename>')
 def serve_generated(filename):
-    return send_from_directory(app.config['GENERATED_FOLDER'], filename)
+    response = send_from_directory(app.config['GENERATED_FOLDER'], filename)
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    return response
+
+@app.route('/masks/<filename>')
+def serve_masks(filename):
+    response = send_from_directory(MASK_FOLDER, filename)
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    return response
 
 @app.route('/outputs/<filename>')
 @require_admin_auth
 def serve_outputs(filename):
     return send_from_directory(app.config['OUTPUT_FOLDER'], filename)
 
-@app.route('/masks/<filename>')
-def serve_masks(filename):
-    return send_from_directory(MASK_FOLDER, filename)
+# @app.route('/masks/<filename>')
+# def serve_masks(filename):
+#     return send_from_directory(MASK_FOLDER, filename)
 
 @app.route('/api/admin/cleanup/<target_folder>', methods=['DELETE'])
 @require_admin_auth
