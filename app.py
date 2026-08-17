@@ -91,7 +91,8 @@ from utils.qr_generator import generate_catalogue_qr
 
 load_dotenv()
 app = Flask(__name__)
-CORS(app, origins="*")
+# CORS(app, origins="*")
+CORS(app, resources={r"/*": {"origins": "*"}})
 
 # ALLOWED_ORIGINS = [
 #     "https://ai.homexperia.com",
@@ -168,6 +169,9 @@ RESET = "\033[00m"
 def require_api_key(f):
     @wraps(f)
     def protected_function(*args, **kwargs):
+        # Allow browser CORS preflight requests
+        if request.method == 'OPTIONS':
+            return f(*args, **kwargs)
         if request.headers.get('x-api-key') != API_KEY:
             return jsonify({'error': 'Unauthorized access'}), 401
         return f(*args, **kwargs)
@@ -176,10 +180,20 @@ def require_api_key(f):
 def require_admin_auth(f):
     @wraps(f)
     def pass_protected_function(*args, **kwargs):
+        # Allow browser CORS preflight requests
+        if request.method == 'OPTIONS':
+            return f(*args, **kwargs)
         if request.headers.get('x-api-key') != API_KEY or request.headers.get('Authorization') != AUTH_TOKEN:
             return jsonify({'error': 'Unauthorized access'}), 401
         return f(*args, **kwargs)
     return pass_protected_function
+
+@app.after_request
+def add_cors_headers(response):
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, x-api-key, ngrok-skip-browser-warning'
+    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS, PUT, DELETE'
+    return response
 
 @log_time
 def load_room_data():
