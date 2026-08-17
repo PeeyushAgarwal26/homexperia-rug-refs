@@ -987,13 +987,27 @@ def rug_visualizer_scene():
 
         height, width = room_img.shape[:2]
 
-        # Default the measurements up front so the fallback further down is
-        # actually reachable — these used to be bound only on the depth happy
-        # path, so any depth failure raised UnboundLocalError and 500'd instead
-        # of degrading to the default room size.
+        # TWO DIFFERENT QUANTITIES — do not collapse them into one:
+        #
+        #   room_*_ft       the MEASURED room, from the depth model calibrated by
+        #                   the reference object. This is the honest answer to
+        #                   "how big is this room", and what gets displayed.
+        #
+        #   quad_*_ft       the physical span of floor_quad_norm's own u and v
+        #                   axes. This is the rug-SIZING basis: the client does
+        #                   hu = rugLength / quad_width_ft and then maps through
+        #                   that same quad, so only this number keeps a rug at
+        #                   its true size on the floor.
+        #
+        # They are close but not equal — the quad is the floor mask's bounding
+        # box, the measurement is the floor's trimmed extent along the camera
+        # axes. Feeding the measured room size into the sizing basis is what
+        # made 12 ft rugs render short.
         room_width_ft = None
         room_length_ft = None
         room_area_sqft = None
+        quad_width_ft = None
+        quad_length_ft = None
 
         # --- Metric depth: computed ONCE here, reused for perspective + room dimensions ---
         depth_map = None
@@ -1074,14 +1088,14 @@ def rug_visualizer_scene():
                     if depth_quad is not None:
                         persp_quad, persp_top_y, quad_w_ft, quad_l_ft = depth_quad
                         quad_source = "depth"
-                        room_width_ft = round(quad_w_ft, 2)
-                        room_length_ft = round(quad_l_ft, 2)
-                        room_area_sqft = round(room_width_ft * room_length_ft, 2)
+                        # Sizing basis only — NOT the room measurement.
+                        quad_width_ft = round(quad_w_ft, 2)
+                        quad_length_ft = round(quad_l_ft, 2)
                         quad_coverage = quad_floor_coverage(persp_quad, visible_floor)
                         cov_txt = f"{quad_coverage*100:.1f}%" if quad_coverage is not None else "n/a"
                         print(f"{GREEN}✅ [PERSPECTIVE] Depth floor quad | u axis "
-                              f"{room_width_ft} ft x v axis {room_length_ft} ft "
-                              f"(vAxisScale {room_width_ft / max(room_length_ft, 1e-6):.3f}) "
+                              f"{quad_width_ft} ft x v axis {quad_length_ft} ft "
+                              f"(vAxisScale {quad_width_ft / max(quad_length_ft, 1e-6):.3f}) "
                               f"| covers {cov_txt} of the floor mask{RESET}")
                         if quad_coverage is not None and quad_coverage < 0.90:
                             print(f"{YELLOW}⚠ [PERSPECTIVE] Quad misses "
@@ -1099,13 +1113,11 @@ def rug_visualizer_scene():
                 dims = _room_dims_from_depth(depth_map, visible_floor, focal_px,
                                              scale_factor=scale_factor, frame=floor_frame)
                 if dims is not None:
-                    # Only a fallback for rug sizing: these axes (camera lateral /
-                    # camera depth) are not the quad's axes, so they are used for
-                    # sizing ONLY when there is no depth quad to measure.
-                    if quad_source != "depth":
-                        room_width_ft = dims['width_ft']
-                        room_length_ft = dims['length_ft']
-                        room_area_sqft = dims['area_sqft']
+                    # THE room measurement: depth model, calibrated by the
+                    # reference object. Always what room_*_ft reports.
+                    room_width_ft = dims['width_ft']
+                    room_length_ft = dims['length_ft']
+                    room_area_sqft = dims['area_sqft']
                     print(f"{CYAN}➡ [DIMENSIONS] {dims['width_ft']} ft (W) x {dims['length_ft']} ft (L) | "
                           f"{dims['area_sqft']} sqft | floor depth {dims['median_depth_m']} m | "
                           f"camera height {dims['camera_height_m']} m{RESET}")
@@ -1131,15 +1143,25 @@ def rug_visualizer_scene():
         if room_area_sqft is None:
             room_area_sqft = round(room_width_ft * room_length_ft, 2)
 
+        # No depth quad (2D fallback) means nothing measured its span, so the
+        # room measurement is the only number left to size against. It does not
+        # describe that quad, so rug scale will be off — quad_source says so.
+        if quad_width_ft is None or quad_length_ft is None:
+            quad_width_ft = room_width_ft
+            quad_length_ft = room_length_ft
+            print(f"{YELLOW}⚠ [QUAD] No measured quad span; falling back to the room "
+                  f"measurement as the sizing basis — rug scale will be approximate{RESET}")
+
         quad_norm = _normalize_quad(persp_quad, width, height)
 
-        # One line per request, always: the quad and the spans that must agree
-        # with it. Enough to spot a bad scene in prod logs without the overlay.
+        # One line per request, always. Both numbers, because they are different
+        # things: quad=* is the rug-sizing basis, room=* is the measured room.
         if quad_coverage is None:
             quad_coverage = quad_floor_coverage(persp_quad, visible_floor)
         print(f"{PURPLE}➡ [QUAD/{quad_source}] norm={[[round(x, 4), round(y, 4)] for x, y in quad_norm]} "
-              f"| u={room_width_ft} ft v={room_length_ft} ft "
-              f"| vAxisScale={room_width_ft / max(room_length_ft, 1e-6):.3f} "
+              f"| quad={quad_width_ft} x {quad_length_ft} ft (sizing) "
+              f"| room={room_width_ft} x {room_length_ft} ft (measured) "
+              f"| vAxisScale={quad_width_ft / max(quad_length_ft, 1e-6):.3f} "
               f"| scale_factor=x{scale_factor:.3f} "
               f"| floor covered={'n/a' if quad_coverage is None else f'{quad_coverage*100:.1f}%'}{RESET}")
 
@@ -1155,14 +1177,17 @@ def rug_visualizer_scene():
             try:
                 previews = data.get('debug_rug_sizes') or [[5.0, 7.0], [9.0, 12.0]]
                 overlay = render_floor_quad_debug(
-                    room_img, persp_quad, room_width_ft, room_length_ft,
+                    # The QUAD spans, because that is what the client sizes with.
+                    room_img, persp_quad, quad_width_ft, quad_length_ft,
                     visible_floor=visible_floor,
                     quad_source=quad_source,
                     rug_previews=[(float(a), float(b)) for a, b in previews],
                     u=float(data.get('debug_u', 0.48)),
                     v=float(data.get('debug_v', 0.76)),
                     rot=float(data.get('debug_rot', 0.0)),
-                    notes=[f"scale_factor    : x{scale_factor:.3f}"],
+                    notes=[f"measured room   : {room_width_ft} x {room_length_ft} ft"
+                           f"  ({room_area_sqft} sqft)",
+                           f"scale_factor    : x{scale_factor:.3f}"],
                 )
                 key = hashlib.md5(
                     f"{room_url or 'b64'}|{'|'.join(floor_mask_urls)}".encode()
@@ -1196,9 +1221,15 @@ def rug_visualizer_scene():
             'floor_quad_norm': quad_norm,
             'floor_mask_b64': _encode_png_b64(visible_floor),
             'shadow_map_b64': encode_shadow_map_b64(shadow_map_float),
+            # The MEASURED room: depth model + reference-object calibration.
             'room_area_sqft': room_area_sqft,
             'room_width_ft': room_width_ft,
             'room_length_ft': room_length_ft,
+            # The rug-SIZING basis: the physical span of floor_quad_norm's own
+            # u (TL->TR) and v (TL->BL) axes. The client must normalise rug size
+            # against THESE, since it maps the result through this same quad.
+            'floor_quad_width_ft': quad_width_ft,
+            'floor_quad_length_ft': quad_length_ft,
             'quad_source': quad_source,
             'quad_floor_coverage': (None if quad_coverage is None
                                     else round(float(quad_coverage), 4)),

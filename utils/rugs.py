@@ -1358,12 +1358,12 @@ def render_floor_quad_debug(room_img, quad, u_span_ft, v_span_ft,
     if tl and tr:
         _dbg_arrow(canvas, tl, tr, _DBG["u_axis"], 3)
         mid = _dbg_uv(Hm, 0.5, 0.0)
-        _dbg_label(canvas, f"u -> room_width_ft = {u_span_ft:.2f} ft",
+        _dbg_label(canvas, f"u -> floor_quad_width_ft = {u_span_ft:.2f} ft",
                    (mid[0] - 90, mid[1] - 14) if mid else None, _DBG["u_axis"])
     if tl and bl:
         _dbg_arrow(canvas, tl, bl, _DBG["v_axis"], 3)
         mid = _dbg_uv(Hm, 0.0, 0.5)
-        _dbg_label(canvas, f"v -> room_length_ft = {v_span_ft:.2f} ft",
+        _dbg_label(canvas, f"v -> floor_quad_length_ft = {v_span_ft:.2f} ft",
                    (mid[0] + 12, mid[1]) if mid else None, _DBG["v_axis"])
 
     # --- Reference rugs, drawn with the CLIENT's sizing math -----------------
@@ -1392,8 +1392,8 @@ def render_floor_quad_debug(room_img, quad, u_span_ft, v_span_ft,
 
     lines = [
         (f"quad source     : {quad_source}", _DBG["ok"] if src_ok else _DBG["warn"]),
-        (f"u span (width)  : {u_span_ft:.2f} ft", _DBG["u_axis"]),
-        (f"v span (length) : {v_span_ft:.2f} ft", _DBG["v_axis"]),
+        (f"quad u span     : {u_span_ft:.2f} ft   <- rug sizing basis", _DBG["u_axis"]),
+        (f"quad v span     : {v_span_ft:.2f} ft   <- rug sizing basis", _DBG["v_axis"]),
         (f"vAxisScale      : {v_axis_scale:.3f}   (client clamps this!)", _DBG["text"]),
         (f"image           : {W_img} x {H_img} px", _DBG["text"]),
         (f"quad taper      : {taper:.3f}  (top/bottom edge, in px)", _DBG["text"]),
