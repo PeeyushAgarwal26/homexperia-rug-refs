@@ -76,7 +76,6 @@ try:
 except Exception:
     pass
 
-
 def load_oneformer_if_needed():
     """OneFormer only. Split out from the SAM load so callers that just need
     panoptic labels — reference-object detection — do not also have to have the
@@ -90,7 +89,6 @@ def load_oneformer_if_needed():
     processor = OneFormerProcessor.from_pretrained("shi-labs/oneformer_ade20k_swin_large")
     segmenter = OneFormerForUniversalSegmentation.from_pretrained("shi-labs/oneformer_ade20k_swin_large").to(device)
     print("✅ [SUCCESS] OneFormer loaded.")
-
 
 def load_models_if_needed():
     global _models_loaded, sam_predictor
@@ -453,26 +451,14 @@ REFERENCE_MIN_AREA = 0.004   # ignore references under 0.4% of the frame
 
 
 def detect_reference_objects(image_cv2, max_dim=1280, min_area_frac=REFERENCE_MIN_AREA):
-    """Find known-size objects (bed / chair / door) for depth-scale calibration.
-
-    Uses the OneFormer model the segmentation pipeline already loads, rather
-    than a remote detector, for three reasons: it is already resident in this
-    process (no API key, no network round-trip, no per-call cost); it returns
-    MASKS, and a bounding box spans a rotated bed's diagonal, which would
-    badly over-read its width; and ADE20k has a `door` class where COCO-trained
-    detectors such as DETR do not -- so on those, a door reference (the most
-    standardized of the three) could never fire at all.
-
-    Returns [{label, ade_label, mask, bbox, area_frac}] with masks at the INPUT
-    image's resolution, so they line up with a full-resolution depth map.
-    """
+    """Find known-size objects (bed / chair / door) for depth-scale calibration."""
     load_oneformer_if_needed()   # SAM is not needed for label-only detection
 
     H0, W0 = image_cv2.shape[:2]
     scale = min(1.0, float(max_dim) / float(max(H0, W0)))
+
     if scale < 1.0:
-        proc = cv2.resize(image_cv2, (max(1, int(W0 * scale)), max(1, int(H0 * scale))),
-                          interpolation=cv2.INTER_AREA)
+        proc = cv2.resize(image_cv2, (max(1, int(W0 * scale)), max(1, int(H0 * scale))),interpolation=cv2.INTER_AREA)
     else:
         proc = image_cv2
 
@@ -522,7 +508,6 @@ def detect_reference_objects(image_cv2, max_dim=1280, min_area_frac=REFERENCE_MI
     print("➡ [REFERENCE] Detected {0} scale reference(s): {1}".format(
         len(found), summary or "none"))
     return found
-
 
 def process_scene_pipeline(image: Image.Image, room_id: str, filename: str, masks_folder: str, generated_folder: str, server_base_url: str):
     

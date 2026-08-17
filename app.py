@@ -91,23 +91,23 @@ from utils.qr_generator import generate_catalogue_qr
 
 load_dotenv()
 app = Flask(__name__)
-# CORS(app, origins="*")
+CORS(app, origins="*")
 
-ALLOWED_ORIGINS = [
-    "https://ai.homexperia.com",
-    "https://precarnival-ernesto-unbiting.ngrok-free.dev",
-    "https://api.homexperia.com",
-    "https://dev.homexperia.com",
-    "http://localhost:5173",
-    "http://localhost:5174"
-]
+# ALLOWED_ORIGINS = [
+#     "https://ai.homexperia.com",
+#     "https://precarnival-ernesto-unbiting.ngrok-free.dev",
+#     "https://api.homexperia.com",
+#     "https://dev.homexperia.com",
+#     "http://localhost:5173",
+#     "http://localhost:5174"
+# ]
 
-CORS(app, resources={
-    r"/api/*": {"origins": ALLOWED_ORIGINS},
-    r"/uploads/*": {"origins": "*"},
-    r"/generated/*": {"origins": "*"},
-    r"/masks/*": {"origins": "*"}   
-})
+# CORS(app, resources={
+#     r"/api/*": {"origins": ALLOWED_ORIGINS},
+#     r"/uploads/*": {"origins": "*"},
+#     r"/generated/*": {"origins": "*"},
+#     r"/masks/*": {"origins": "*"}   
+# })
 
 UPLOAD_FOLDER = 'uploads'
 GENERATED_FOLDER = 'generated'
@@ -142,28 +142,28 @@ LIGHT_GRAY = "\033[97m"
 BLACK = "\033[90m"
 RESET = "\033[00m"
 
-@app.before_request
-def enforce_strict_origins():
-    # Bypass Static Assets
-    public_paths = [f"/{UPLOAD_FOLDER}/", f"/{GENERATED_FOLDER}/", f"/{MASK_FOLDER}/", f"/wallart-tester"]
-    if any(request.path.startswith(path) for path in public_paths):
-        return  # Skip strict validation for images
+# @app.before_request
+# def enforce_strict_origins():
+#     # Bypass Static Assets
+#     public_paths = [f"/{UPLOAD_FOLDER}/", f"/{GENERATED_FOLDER}/", f"/{MASK_FOLDER}/", f"/wallart-tester"]
+#     if any(request.path.startswith(path) for path in public_paths):
+#         return  # Skip strict validation for images
 
-    # Evaluate Origin and Referer headers
-    origin = request.headers.get("Origin")
-    referer = request.headers.get("Referer")
+#     # Evaluate Origin and Referer headers
+#     origin = request.headers.get("Origin")
+#     referer = request.headers.get("Referer")
 
-    # If an origin is present (all valid frontend web browsers), check it strictly
-    if origin and origin not in ALLOWED_ORIGINS:
-        abort(403)
+#     # If an origin is present (all valid frontend web browsers), check it strictly
+#     if origin and origin not in ALLOWED_ORIGINS:
+#         abort(403)
         
-    # If a user is directly opening the link or using Postman without an Origin header,
-    # you can fallback to checking if the traffic originated from your domains:
-    if not origin and referer:
-        if not any(domain in referer for domain in ALLOWED_ORIGINS):
-            abort(403)
+#     # If a user is directly opening the link or using Postman without an Origin header,
+#     # you can fallback to checking if the traffic originated from your domains:
+#     if not origin and referer:
+#         if not any(domain in referer for domain in ALLOWED_ORIGINS):
+#             abort(403)
     
-    if not origin and not referer: abort(403)
+#     if not origin and not referer: abort(403)
 
 def require_api_key(f):
     @wraps(f)
@@ -927,16 +927,7 @@ def _normalize_quad(quad, width, height):
     ]
 
 def get_reference_scale(cache_key, room_img, depth_map, focal_px, floor_frame):
-    """Reference-object depth-scale factor, computed once per (image, floor mask).
-
-    The rug route is hit repeatedly for the same room — once per rug swap — and
-    the factor depends only on the photo and its floor mask, so the OneFormer
-    detection pass and the measurement would otherwise repeat for an identical
-    answer. Caching the finished factor rather than the detections also
-    guarantees every call for a room returns the SAME number: masks are far too
-    large to keep, and re-measuring from cached bounding boxes instead would
-    silently give a different (worse) answer on the second call than the first.
-    """
+    """Reference-object depth-scale factor, computed once per (image, floor mask)."""
     if cache_key is not None:
         with _reference_cache_lock:
             if cache_key in _reference_cache:
@@ -987,22 +978,6 @@ def rug_visualizer_scene():
 
         height, width = room_img.shape[:2]
 
-        # TWO DIFFERENT QUANTITIES — do not collapse them into one:
-        #
-        #   room_*_ft       the MEASURED room, from the depth model calibrated by
-        #                   the reference object. This is the honest answer to
-        #                   "how big is this room", and what gets displayed.
-        #
-        #   quad_*_ft       the physical span of floor_quad_norm's own u and v
-        #                   axes. This is the rug-SIZING basis: the client does
-        #                   hu = rugLength / quad_width_ft and then maps through
-        #                   that same quad, so only this number keeps a rug at
-        #                   its true size on the floor.
-        #
-        # They are close but not equal — the quad is the floor mask's bounding
-        # box, the measurement is the floor's trimmed extent along the camera
-        # axes. Feeding the measured room size into the sizing basis is what
-        # made 12 ft rugs render short.
         room_width_ft = None
         room_length_ft = None
         room_area_sqft = None
@@ -1020,11 +995,6 @@ def rug_visualizer_scene():
 
         focal_px = 0.8 * max(width, height)
 
-        # The floor quad the client renders on, and its own size in feet. These
-        # travel together on purpose: floor_quad_norm IS the plane the client
-        # builds its homography from, and room_width_ft / room_length_ft are the
-        # divisors it normalises rug size against. Sourcing them from two
-        # separate measurements rescales every rug by their disagreement.
         persp_quad, persp_top_y = floor_quad, floor_top_y
         quad_source = "2d_fallback"
         quad_coverage = None
@@ -1034,21 +1004,17 @@ def rug_visualizer_scene():
         scale_samples = []
         if depth_map is not None:
             try:
-                # Fit the floor plane ONCE; the calibration, the quad and the
-                # dimensions all read the same plane.
+                # Fit the floor plane ONCE; the calibration, the quad and the dimensions all read the same plane.
                 floor_frame = _fit_floor_frame(depth_map, visible_floor, focal_px)
 
-                # Reference-object calibration: find objects of known real size
-                # and use them to correct the depth model's absolute scale.
+                # Reference-object calibration: find objects of known real size and use them to correct the depth model's absolute scale.
                 if floor_frame is not None:
                     try:
-                        # Only cacheable when the room is identified by URL — a
-                        # b64 upload has no stable key to cache against.
+                        # Only cacheable when the room is identified by URL — a b64 upload has no stable key to cache against.
                         ref_key = (room_url, tuple(floor_mask_urls)) if room_url else None
-                        scale_factor, scale_samples = get_reference_scale(
-                            ref_key, room_img, depth_map, focal_px, floor_frame)
-                        marks = {'selected': '✓', 'rejected': '✗',
-                                 'not-selected': '·', 'skipped': '–'}
+                        scale_factor, scale_samples = get_reference_scale(ref_key, room_img, depth_map, focal_px, floor_frame)
+                        marks = {'selected': '✓', 'rejected': '✗', 'not-selected': '·', 'skipped': '-'}
+
                         for s in scale_samples:
                             status = s.get('status', '?')
                             measured = s.get('measured_ft')
@@ -1060,21 +1026,18 @@ def rug_visualizer_scene():
                             print(f"{CYAN}   {marks.get(status, '?')} [REF] "
                                   f"{s['label']} #{s.get('index')}: {body}{reason}{RESET}")
 
-                        winner = next((s for s in scale_samples
-                                       if s.get('status') == 'selected'), None)
+                        winner = next((s for s in scale_samples if s.get('status') == 'selected'), None)
                         if winner is not None:
-                            same_class = sum(1 for s in scale_samples
-                                             if s['label'] == winner['label'])
+                            same_class = sum(1 for s in scale_samples if s['label'] == winner['label'])
                             print(f"{GREEN}✅ [SCALE] x{scale_factor:.3f} from "
                                   f"{winner['label']} #{winner['index']} "
                                   f"(best of {same_class} {winner['label']} instance(s); "
                                   f"priority {' > '.join(rug_priority)}){RESET}")
                         else:
-                            print(f"{YELLOW}⚠ [SCALE] No usable reference object; "
-                                  f"depth scale left uncorrected{RESET}")
+                            print(f"{YELLOW}⚠ [SCALE] No usable reference object; depth scale left uncorrected{RESET}")
+
                     except Exception as ref_err:
-                        print(f"{YELLOW}⚠ [SCALE] Reference calibration failed ({ref_err}); "
-                              f"depth scale left uncorrected{RESET}")
+                        print(f"{YELLOW}⚠ [SCALE] Reference calibration failed ({ref_err}); depth scale left uncorrected{RESET}")
                         import traceback
                         traceback.print_exc()
 
@@ -1085,6 +1048,7 @@ def rug_visualizer_scene():
                     depth_quad = _floor_quad_from_depth(
                         depth_map, visible_floor, focal_px, room_img.shape,
                         frame=floor_frame, scale_factor=scale_factor)
+                    
                     if depth_quad is not None:
                         persp_quad, persp_top_y, quad_w_ft, quad_l_ft = depth_quad
                         quad_source = "depth"
@@ -1093,43 +1057,37 @@ def rug_visualizer_scene():
                         quad_length_ft = round(quad_l_ft, 2)
                         quad_coverage = quad_floor_coverage(persp_quad, visible_floor)
                         cov_txt = f"{quad_coverage*100:.1f}%" if quad_coverage is not None else "n/a"
+
                         print(f"{GREEN}✅ [PERSPECTIVE] Depth floor quad | u axis "
                               f"{quad_width_ft} ft x v axis {quad_length_ft} ft "
                               f"(vAxisScale {quad_width_ft / max(quad_length_ft, 1e-6):.3f}) "
                               f"| covers {cov_txt} of the floor mask{RESET}")
+
                         if quad_coverage is not None and quad_coverage < 0.90:
-                            print(f"{YELLOW}⚠ [PERSPECTIVE] Quad misses "
-                                  f"{(1-quad_coverage)*100:.0f}% of the floor mask — a rug sized "
-                                  f"against it cannot reach the walls{RESET}")
+                            print(f"{YELLOW}⚠ [PERSPECTIVE] Quad misses {(1-quad_coverage)*100:.0f}% of the floor mask — a rug sized against it cannot reach the walls{RESET}")
                     else:
-                        print(f"{YELLOW}⚠ [PERSPECTIVE] Depth quad fit failed; keeping geometric "
-                              f"quad — its real size is UNKNOWN, so rug scale will be off{RESET}")
+                        print(f"{YELLOW}⚠ [PERSPECTIVE] Depth quad fit failed; keeping geometric quad — its real size is UNKNOWN, so rug scale will be off{RESET}")
+
                 except Exception as e:
-                    print(f"{YELLOW}⚠ [PERSPECTIVE] Depth perspective failed ({e}); "
-                          f"keeping geometric quad{RESET}")
+                    print(f"{YELLOW}⚠ [PERSPECTIVE] Depth perspective failed ({e}); keeping geometric quad{RESET}")
                     import traceback
                     traceback.print_exc()
 
-                dims = _room_dims_from_depth(depth_map, visible_floor, focal_px,
-                                             scale_factor=scale_factor, frame=floor_frame)
+                dims = _room_dims_from_depth(depth_map, visible_floor, focal_px, scale_factor=scale_factor, frame=floor_frame)
+
                 if dims is not None:
-                    # THE room measurement: depth model, calibrated by the
-                    # reference object. Always what room_*_ft reports.
+                    # THE room measurement: depth model, calibrated by the reference object. Always what room_*_ft reports.
                     room_width_ft = dims['width_ft']
                     room_length_ft = dims['length_ft']
                     room_area_sqft = dims['area_sqft']
-                    print(f"{CYAN}➡ [DIMENSIONS] {dims['width_ft']} ft (W) x {dims['length_ft']} ft (L) | "
-                          f"{dims['area_sqft']} sqft | floor depth {dims['median_depth_m']} m | "
-                          f"camera height {dims['camera_height_m']} m{RESET}")
-                    # Camera height is a free cross-check: a real room photo is
-                    # shot from 1.1-1.6 m. Well outside that means the scale is
-                    # wrong, whatever the reference object reported.
+
+                    print(f"{CYAN}➡ [DIMENSIONS] {dims['width_ft']} ft (W) x {dims['length_ft']} ft (L) | {dims['area_sqft']} sqft | floor depth {dims['median_depth_m']} m | camera height {dims['camera_height_m']} m{RESET}")
+
                     if not (0.95 <= dims['camera_height_m'] <= 1.85):
-                        print(f"{YELLOW}⚠ [SANITY] Camera height {dims['camera_height_m']} m is "
-                              f"outside the plausible 1.1-1.6 m for a room photo — "
-                              f"the scale is probably off{RESET}")
+                        print(f"{YELLOW}⚠ [SANITY] Camera height {dims['camera_height_m']} m is outside the plausible 1.1-1.6 m for a room photo — the scale is probably off{RESET}")
                 else:
                     print(f"{YELLOW}⚠ [DIMENSIONS] Could not fit a floor plane for dimensions{RESET}")
+
             except Exception as e:
                 print(f"{YELLOW}⚠ [DIMENSIONS] Depth dimension estimation failed ({e}){RESET}")
                 import traceback
@@ -1143,14 +1101,12 @@ def rug_visualizer_scene():
         if room_area_sqft is None:
             room_area_sqft = round(room_width_ft * room_length_ft, 2)
 
-        # No depth quad (2D fallback) means nothing measured its span, so the
-        # room measurement is the only number left to size against. It does not
-        # describe that quad, so rug scale will be off — quad_source says so.
+        # No depth quad (2D fallback) means nothing measured its span, so the room measurement is the only number left to size against. 
+        # It does not describe that quad, so rug scale will be off — quad_source says so.
         if quad_width_ft is None or quad_length_ft is None:
             quad_width_ft = room_width_ft
             quad_length_ft = room_length_ft
-            print(f"{YELLOW}⚠ [QUAD] No measured quad span; falling back to the room "
-                  f"measurement as the sizing basis — rug scale will be approximate{RESET}")
+            print(f"{YELLOW}⚠ [QUAD] No measured quad span; falling back to the room measurement as the sizing basis — rug scale will be approximate{RESET}")
 
         quad_norm = _normalize_quad(persp_quad, width, height)
 
@@ -1165,14 +1121,10 @@ def rug_visualizer_scene():
               f"| scale_factor=x{scale_factor:.3f} "
               f"| floor covered={'n/a' if quad_coverage is None else f'{quad_coverage*100:.1f}%'}{RESET}")
 
-        # --- Visual debugger --------------------------------------------------
-        # Opt-in per request ("debug": true) or globally via RUG_VISUALIZER_DEBUG=1.
-        # Draws the quad the way the CLIENT reads it: a 1-foot grid built from
-        # room_width_ft / room_length_ft, plus reference rug footprints rendered
-        # with geometry.js's own math. If the 1-ft cells do not read as real
-        # floor tiles, the spans do not describe this quad.
+        # --- Visual debugger ---
         debug_image_url = None
         want_debug = bool(data.get('debug')) or os.getenv('RUG_VISUALIZER_DEBUG') == '1'
+
         if want_debug:
             try:
                 previews = data.get('debug_rug_sizes') or [[5.0, 7.0], [9.0, 12.0]]
@@ -1189,14 +1141,17 @@ def rug_visualizer_scene():
                            f"  ({room_area_sqft} sqft)",
                            f"scale_factor    : x{scale_factor:.3f}"],
                 )
+
                 key = hashlib.md5(
                     f"{room_url or 'b64'}|{'|'.join(floor_mask_urls)}".encode()
                 ).hexdigest()[:10]
+
                 fname = f"rugdebug_{key}.jpg"
-                cv2.imwrite(os.path.join(app.config['GENERATED_FOLDER'], fname),
-                            overlay, [cv2.IMWRITE_JPEG_QUALITY, 90])
+
+                cv2.imwrite(os.path.join(app.config['GENERATED_FOLDER'], fname), overlay, [cv2.IMWRITE_JPEG_QUALITY, 90])
                 debug_image_url = f"https://precarnival-ernesto-unbiting.ngrok-free.dev/generated/{fname}"
                 print(f"{GREEN}🖼  [QUAD-DEBUG] {debug_image_url}{RESET}")
+
             except Exception as dbg_err:
                 print(f"{YELLOW}⚠ [QUAD-DEBUG] Overlay failed ({dbg_err}){RESET}")
                 import traceback
@@ -1221,24 +1176,25 @@ def rug_visualizer_scene():
             'floor_quad_norm': quad_norm,
             'floor_mask_b64': _encode_png_b64(visible_floor),
             'shadow_map_b64': encode_shadow_map_b64(shadow_map_float),
+
             # The MEASURED room: depth model + reference-object calibration.
             'room_area_sqft': room_area_sqft,
             'room_width_ft': room_width_ft,
             'room_length_ft': room_length_ft,
-            # The rug-SIZING basis: the physical span of floor_quad_norm's own
-            # u (TL->TR) and v (TL->BL) axes. The client must normalise rug size
-            # against THESE, since it maps the result through this same quad.
-            'floor_quad_width_ft': quad_width_ft,
-            'floor_quad_length_ft': quad_length_ft,
+
+            # # The rug-SIZING basis: the physical span of floor_quad_norm's own u (TL->TR) and v (TL->BL) axes. 
+            # # The client must normalise rug size against THESE, since it maps the result through this same quad.
+            # 'floor_quad_width_ft': quad_width_ft,
+            # 'floor_quad_length_ft': quad_length_ft,
+
             'quad_source': quad_source,
-            'quad_floor_coverage': (None if quad_coverage is None
-                                    else round(float(quad_coverage), 4)),
-            'scale_factor': round(float(scale_factor), 4),
-            # Underscore-prefixed keys are internal (debug-overlay drawing data)
-            'scale_references': [
-                {k: v for k, v in s.items() if not k.startswith('_')}
-                for s in scale_samples
-            ]
+            # 'quad_floor_coverage': (None if quad_coverage is None else round(float(quad_coverage), 4)),
+            # 'scale_factor': round(float(scale_factor), 4),
+            # # Underscore-prefixed keys are internal (debug-overlay drawing data)
+            # 'scale_references': [
+            #     {k: v for k, v in s.items() if not k.startswith('_')}
+            #     for s in scale_samples
+            # ]
         }
         if debug_image_url:
             payload['debug_image_url'] = debug_image_url
