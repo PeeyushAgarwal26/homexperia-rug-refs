@@ -775,7 +775,7 @@ def detect_reference_objects(image_cv2, max_dim=1280, min_area_frac=REFERENCE_MI
         proc = image_cv2
 
     pil_image = Image.fromarray(cv2.cvtColor(proc, cv2.COLOR_BGR2RGB))
-    inputs = processor(images=pil_image, task_inputs=["panoptic"], return_tensors="pt").to(device)
+    inputs = processor(images=pil_image, return_tensors="pt").to(device)
     with torch.no_grad():
         outputs = segmenter(**inputs)
     result = processor.post_process_panoptic_segmentation(
